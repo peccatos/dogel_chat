@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "dogel.bin"
+name = "dogel"
 path = "src/main.rs"
 
 [dependencies]
