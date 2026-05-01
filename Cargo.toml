@@ -1,18 +1,15 @@
 [workspace]
-resolver = "2"
 members = [
     "crates/dogel-cli",
     "crates/eve-core",
+    "crates/eve-crypto",
+    "crates/eve-storage",
+    "crates/eve-p2p",
+    "crates/eve-protocol",
 ]
+resolver = "2"
 
 [workspace.package]
 edition = "2021"
+version = "0.1.0"
 license = "MIT"
-repository = "https://example.invalid/dogel"
-rust-version = "1.76"
-
-[workspace.dependencies]
-anyhow = "1.0"
-thiserror = "1.0"
-shell-words = "1.1"
-rustyline = "14.0"

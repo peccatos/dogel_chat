@@ -1,15 +1,27 @@
 [package]
 name = "dogel-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+eve-protocol = { path = "../eve-protocol" }
+eve-crypto = { path = "../eve-crypto" }
+base64 = "0.22"
+blake3 = "1.5"
+eve-core = { path = "../eve-core" }
+eve-p2p = { path = "../eve-p2p" }
+eve-storage = { path = "../eve-storage" }
+rpassword = "7.3"
+rustyline = "14.0"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "sync"] }
+libp2p = { version = "0.54", default-features = false }
+# Phase 11 minimal terminal UI.
+ratatui = "0.27"
+crossterm = "0.27"
 
 [[bin]]
 name = "dogel"
 path = "src/main.rs"
-
-[dependencies]
-anyhow.workspace = true
-rustyline.workspace = true
-eve-core = { path = "../eve-core" }

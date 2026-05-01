@@ -1,105 +1,91 @@
-# dogel.bin v0.1 phase 1
+# dogel.bin v0.1 phase 11
 
-This is the first implementation slice for `dogel.bin`.
+Phase 11 keeps the working encrypted P2P messaging core, trust layer, strict message policy, crypto-hardening and online invites, then adds a minimal TUI mode plus stabilization commands.
 
-Included:
+## Startup
 
-- Rust workspace skeleton.
-- `dogel-cli` binary crate.
-- Cargo-safe binary target named `dogel`.
-- Optional build helper that copies `target/*/dogel` to `target/*/dogel.bin`.
-- `eve-core` crate with shell-like command parsing.
-- Interactive shell runtime.
-- `/help` and `/quit`.
-- Parser support for quoted flags.
-- `/msg` free text parsing.
-- Unit tests for the command parser.
+Classic shell mode:
 
-Not included yet:
-
-- libp2p networking.
-- identity storage.
-- cryptography.
-- room runtime state.
-- encrypted messaging.
-
-## Important naming note
-
-Cargo does **not** allow `.` in a Rust binary target name.
-
-This is invalid:
-
-```toml
-[[bin]]
-name = "dogel.bin"
+```bash
+cargo run -p dogel-cli -- --listen /ip4/0.0.0.0/tcp/7777
 ```
 
-So the Cargo target is named:
+Minimal TUI mode:
 
-```text
-dogel
+```bash
+cargo run -p dogel-cli -- --tui --listen /ip4/0.0.0.0/tcp/7777
 ```
 
-The produced executable can still be copied/installed as:
-
-```text
-dogel.bin
-```
-
-Use the included `Makefile`:
+Build `dogel.bin`:
 
 ```bash
 make build
+./target/debug/dogel.bin --tui --listen /ip4/0.0.0.0/tcp/7777
 ```
 
-This builds the valid Cargo binary and then creates:
+## TUI scope
+
+The TUI is intentionally minimal:
+
+- alternate-screen terminal interface;
+- header with identity, room, peer count, trust count, policy and debug status;
+- session log panel;
+- single-line input panel;
+- same command parser as shell mode;
+- ordinary text without `/` still sends to active room;
+- strict message policy remains active;
+- no paste mode;
+- no multiline input;
+- no file transfer.
+
+The shell mode remains the most stable debugging interface.
+
+## New commands
 
 ```text
-target/debug/dogel.bin
+/doctor
+/debug on
+/debug off
 ```
 
-## Run during development
+`/doctor` prints a health report for identity, P2P, rooms, invites, trust and policy.
 
-```bash
-cargo run -p dogel-cli
-```
+`/debug on|off` toggles runtime debug state. Phase 11 stores the flag and surfaces it in `/doctor`/TUI. Deeper debug routing can be attached later.
 
-or:
+## Existing invite flow
 
-```bash
-cargo run -p dogel-cli --bin dogel
-```
-
-## Build `dogel.bin`
-
-Debug:
-
-```bash
-make build
-./target/debug/dogel.bin
-```
-
-Release:
-
-```bash
-make release
-./target/release/dogel.bin
-```
-
-## Test
-
-```bash
-cargo test
-```
-
-## Example session
+Peer A:
 
 ```text
-dogel> /help
-dogel> /identity create elliot
-dogel> /login elliot
-dogel> /join 123 --secret "red wheelbarrow" --ephemeral
-dogel> /room add-peer 12D3KooWBob
-dogel> /msg hello world
-dogel> /quit
+/login <alias-a>
+/connect /ip4/<host>/tcp/<port>/p2p/<peer-id-b>
+/create-room --ephemeral
+/invite <peer-id-b>
 ```
+
+Peer B:
+
+```text
+/login <alias-b>
+/connect /ip4/<host>/tcp/<port>/p2p/<peer-id-a>
+/invites
+/accept-invite <invite-id>
+hello
+```
+
+## Security notes
+
+- Private keys are encrypted locally using password-derived keys.
+- Messages are encrypted with room keys and signed.
+- Room passphrase derivation uses Argon2id in the dev shortcut paths.
+- Online invites use the already-secured libp2p Noise channel and signed invite payloads.
+- Strict policy rejects links, multiline input, control characters and bursts before encryption.
+- TUI mode does not weaken policy; it keeps single-line input only.
+
+## Known limitations
+
+- TUI is minimal and not yet a full ratatui application architecture.
+- Some low-level background diagnostics may still be printed by runtime tasks.
+- Online invites are not offline X25519 sealed invites yet.
+- No local encrypted history writer yet.
+- No relay/bootstrap/NAT traversal yet.

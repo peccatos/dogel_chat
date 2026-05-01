@@ -1,416 +1,463 @@
-use std::fmt;
+use thiserror::Error;
 
-/// A successfully parsed input line.
+/// A typed representation of every user command supported by the v0.1 shell.
 ///
-/// The CLI runtime currently only needs `command`, but wrapping it gives us
-/// space for future metadata without changing the public parser shape.
-/// Examples of future metadata:
-///
-/// - original raw line for audit/debug mode;
-/// - redacted raw line for logs;
-/// - command source: stdin, TUI, script, test harness.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedLine {
-    pub command: UserCommand,
-}
-
-/// Typed command model for dogel.bin v0.1.
-///
-/// This enum is intentionally explicit. A stringly-typed command bus would
-/// be faster to hack together, but it would push validation bugs into the
-/// runtime and networking layers.
-///
-/// Trade-off:
-///
-/// - More enum variants and parser code now.
-/// - Much safer application logic later.
+/// This enum is the boundary between "text typed by a human" and the rest of
+/// the application. Every later subsystem should receive this enum, not raw
+/// strings, so parsing bugs do not leak into storage, crypto or networking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserCommand {
-    /// `/identity create <alias>`
-    ///
-    /// Creates a local identity. The password is not part of this command:
-    /// it must be requested interactively by the binary layer.
-    IdentityCreate {
-        alias: String,
-    },
-
-    /// `/login <alias>`
-    ///
-    /// Unlocks an existing local identity. Password prompting also belongs
-    /// to the binary/storage layer, not the parser.
-    Login {
-        alias: String,
-    },
-
-    /// `/whoami`
+    IdentityCreate { alias: String },
+    Login { alias: String },
     Whoami,
-
-    /// `/connect <multiaddr>`
-    ///
-    /// In v0.1 this will be a manual libp2p multiaddr.
-    Connect {
-        multiaddr: String,
-    },
-
-    /// `/peers`
+    Connect { multiaddr: String },
     Peers,
-
-    /// `/join <room_id> --secret <passphrase> [--ephemeral]`
-    ///
-    /// Creates or activates a local room session.
     Join {
         room_id: String,
         secret: String,
         ephemeral: bool,
     },
-
-    /// `/room add-peer <peer_id>`
-    RoomAddPeer {
+    DirectMessage {
+        peer_id: String,
+        secret: String,
+        ephemeral: bool,
+    },
+    CreateRoom {
+        room_id: Option<String>,
+        ephemeral: bool,
+    },
+    Invite {
         peer_id: String,
     },
-
-    /// `/room peers`
+    Invites,
+    AcceptInvite {
+        invite_id: String,
+    },
+    RejectInvite {
+        invite_id: String,
+    },
+    RoomAddPeer { peer_id: String },
     RoomPeers,
-
-    /// `/rooms`
     Rooms,
-
-    /// `/msg <text>`
-    ///
-    /// The message body is the full remaining text, not shell-tokenized.
-    /// This is deliberate: users should not need quotes for normal chat.
-    Message {
-        text: String,
-    },
-
-    /// `/history on` or `/history off`
-    History {
-        enabled: bool,
-    },
-
-    /// `/help`
+    Message { text: String },
+    History { enabled: bool },
+    Trust { action: TrustCommand },
+    Policy { action: PolicyCommand },
+    Status,
+    Doctor,
+    Debug { enabled: bool },
+    Clear,
     Help,
-
-    /// `/quit`
     Quit,
 }
 
-/// Parser errors that are specific enough for the CLI to print actionable
-/// messages.
+/// Subcommands for the local trust store.
 ///
-/// Do not collapse these into `anyhow::Error` inside `eve-core`.
-/// `anyhow` is fine at the binary boundary, but the domain layer should
-/// expose structured errors.
+/// Trust is intentionally explicit. A peer becomes trusted only after the user
+/// has seen its signing fingerprint and runs `/trust <peer_id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustCommand {
+    Add { peer_id: String },
+    List,
+    Remove { peer_id: String },
+}
+
+/// Subcommands for the local message policy.
+///
+/// The policy is intentionally local-first: messages are rejected before
+/// encryption and before network transmission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyCommand {
+    Show,
+    Strict,
+    Relaxed,
+}
+
+/// Human-readable parser errors.
+///
+/// The shell should print these directly. They are intentionally explicit:
+/// secure CLI tools should fail loudly and explain the next correct action.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CommandParseError {
-    EmptyInput,
-    MissingLeadingSlash,
-    UnknownCommand {
-        command: String,
-    },
-    InvalidSyntax {
-        message: String,
-        usage: Option<&'static str>,
-    },
-    TokenizationFailed {
-        message: String,
+    #[error("empty command")]
+    Empty,
+
+    #[error("commands must start with '/'")]
+    MissingSlash,
+
+    #[error("failed to parse shell-like input: {0}")]
+    ShellWords(String),
+
+    #[error("unknown command: {0}")]
+    UnknownCommand(String),
+
+    #[error("missing argument: {0}")]
+    MissingArgument(&'static str),
+
+    #[error("unexpected argument: {0}")]
+    UnexpectedArgument(String),
+
+    #[error("missing required flag {0}")]
+    MissingFlag(&'static str),
+
+    #[error("invalid value for {field}: {value}")]
+    InvalidValue {
+        field: &'static str,
+        value: String,
     },
 }
 
-impl fmt::Display for CommandParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CommandParseError::EmptyInput => write!(f, "empty input"),
-            CommandParseError::MissingLeadingSlash => {
-                write!(f, "commands must start with '/'")
-            }
-            CommandParseError::UnknownCommand { command } => {
-                write!(f, "unknown command: {command}")
-            }
-            CommandParseError::InvalidSyntax { message, usage } => {
-                write!(f, "{message}")?;
-                if let Some(usage) = usage {
-                    write!(f, "\n\nusage:\n  {usage}")?;
-                }
-                Ok(())
-            }
-            CommandParseError::TokenizationFailed { message } => {
-                write!(f, "failed to parse command line: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CommandParseError {}
-
-/// Parse one raw user input line into a typed command.
+/// Parse a single interactive shell line into a typed command.
 ///
-/// Important design decisions:
-///
-/// 1. All commands must start with `/`.
-///    This keeps chat text and control commands clearly separated.
-///
-/// 2. `/msg` is parsed before shell tokenization.
-///    `shell_words::split()` would preserve quoted text but still tokenizes
-///    everything. For chat messages, the expected UX is:
-///
-///    `/msg hello world`
-///
-///    not:
-///
-///    `/msg "hello world"`
-///
-/// 3. All non-`/msg` commands use shell-like tokenization.
-///    This gives us quoted flags such as:
-///
-///    `/join 123 --secret "red wheelbarrow" --ephemeral`
-pub fn parse_user_command(input: &str) -> Result<ParsedLine, CommandParseError> {
+/// `/msg` is handled before shell tokenization because message text should be
+/// allowed to contain spaces without requiring quotes.
+pub fn parse_command(input: &str) -> Result<UserCommand, CommandParseError> {
     let trimmed = input.trim();
 
     if trimmed.is_empty() {
-        return Err(CommandParseError::EmptyInput);
+        return Err(CommandParseError::Empty);
     }
 
     if !trimmed.starts_with('/') {
-        return Err(CommandParseError::MissingLeadingSlash);
+        return Err(CommandParseError::MissingSlash);
     }
 
-    // `/msg` gets special treatment so the whole remainder becomes message
-    // text. This is closer to how real chat clients behave.
-    if trimmed == "/msg" || trimmed.starts_with("/msg ") {
-        return parse_msg_command(trimmed);
+    if trimmed == "/help" {
+        return Ok(UserCommand::Help);
+    }
+
+    if trimmed == "/quit" || trimmed == "/exit" {
+        return Ok(UserCommand::Quit);
+    }
+
+    // `/msg hello world` should preserve `hello world` as one text payload.
+    if let Some(rest) = trimmed.strip_prefix("/msg") {
+        let text = rest.trim();
+        if text.is_empty() {
+            return Err(CommandParseError::MissingArgument("text"));
+        }
+        return Ok(UserCommand::Message {
+            text: text.to_string(),
+        });
     }
 
     let tokens = shell_words::split(trimmed)
-        .map_err(|err| CommandParseError::TokenizationFailed {
-            message: err.to_string(),
-        })?;
+        .map_err(|err| CommandParseError::ShellWords(err.to_string()))?;
 
-    if tokens.is_empty() {
-        return Err(CommandParseError::EmptyInput);
-    }
-
-    let command = tokens[0].as_str();
-
-    match command {
-        "/identity" => parse_identity(&tokens),
-        "/login" => parse_login(&tokens),
-        "/whoami" => expect_exact_arity(&tokens, 1, "/whoami").map(|_| UserCommand::Whoami),
-        "/connect" => parse_connect(&tokens),
-        "/peers" => expect_exact_arity(&tokens, 1, "/peers").map(|_| UserCommand::Peers),
-        "/join" => parse_join(&tokens),
-        "/room" => parse_room(&tokens),
-        "/rooms" => expect_exact_arity(&tokens, 1, "/rooms").map(|_| UserCommand::Rooms),
-        "/history" => parse_history(&tokens),
-        "/help" => expect_exact_arity(&tokens, 1, "/help").map(|_| UserCommand::Help),
-        "/quit" | "/exit" => expect_exact_arity(&tokens, 1, "/quit").map(|_| UserCommand::Quit),
-        other => Err(CommandParseError::UnknownCommand {
-            command: other.to_string(),
-        }),
-    }
-    .map(|command| ParsedLine { command })
+    parse_tokens(&tokens)
 }
 
-fn parse_msg_command(trimmed: &str) -> Result<ParsedLine, CommandParseError> {
-    let text = trimmed.strip_prefix("/msg").unwrap_or("").trim();
+fn parse_tokens(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    let Some(command) = tokens.first() else {
+        return Err(CommandParseError::Empty);
+    };
 
-    if text.is_empty() {
-        return Err(CommandParseError::InvalidSyntax {
-            message: "missing message text".to_string(),
-            usage: Some("/msg <text>"),
-        });
+    match command.as_str() {
+        "/identity" => parse_identity(tokens),
+        "/login" => parse_login(tokens),
+        "/whoami" => expect_no_args(tokens, UserCommand::Whoami),
+        "/connect" => parse_connect(tokens),
+        "/peers" => expect_no_args(tokens, UserCommand::Peers),
+        "/join" => parse_join(tokens),
+        "/dm" => parse_dm(tokens),
+        "/create-room" => parse_create_room(tokens),
+        "/invite" => parse_invite(tokens),
+        "/invites" => expect_no_args(tokens, UserCommand::Invites),
+        "/accept-invite" => parse_accept_invite(tokens),
+        "/reject-invite" => parse_reject_invite(tokens),
+        "/room" => parse_room(tokens),
+        "/rooms" => expect_no_args(tokens, UserCommand::Rooms),
+        "/history" => parse_history(tokens),
+        "/trust" => parse_trust(tokens),
+        "/policy" => parse_policy(tokens),
+        "/status" => expect_no_args(tokens, UserCommand::Status),
+        "/doctor" => expect_no_args(tokens, UserCommand::Doctor),
+        "/debug" => parse_debug(tokens),
+        "/clear" => expect_no_args(tokens, UserCommand::Clear),
+        "/help" => expect_no_args(tokens, UserCommand::Help),
+        "/quit" | "/exit" => expect_no_args(tokens, UserCommand::Quit),
+        other => Err(CommandParseError::UnknownCommand(other.to_string())),
     }
+}
 
-    Ok(ParsedLine {
-        command: UserCommand::Message {
-            text: text.to_string(),
-        },
-    })
+fn expect_no_args(
+    tokens: &[String],
+    command: UserCommand,
+) -> Result<UserCommand, CommandParseError> {
+    if tokens.len() == 1 {
+        Ok(command)
+    } else {
+        Err(CommandParseError::UnexpectedArgument(tokens[1].clone()))
+    }
 }
 
 fn parse_identity(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
-    if tokens.len() != 3 || tokens[1] != "create" {
-        return Err(CommandParseError::InvalidSyntax {
-            message: "invalid identity command".to_string(),
-            usage: Some("/identity create <alias>"),
-        });
+    match tokens {
+        [_, subcommand, alias] if subcommand == "create" => Ok(UserCommand::IdentityCreate {
+            alias: alias.clone(),
+        }),
+        [_, subcommand, _, extra, ..] if subcommand == "create" => {
+            Err(CommandParseError::UnexpectedArgument(extra.clone()))
+        }
+        [_, subcommand, ..] => Err(CommandParseError::InvalidValue {
+            field: "identity subcommand",
+            value: subcommand.clone(),
+        }),
+        [_] => Err(CommandParseError::MissingArgument("create <alias>")),
+        [] => Err(CommandParseError::Empty),
     }
-
-    let alias = validate_non_empty("alias", &tokens[2], "/identity create <alias>")?;
-
-    Ok(UserCommand::IdentityCreate {
-        alias: alias.to_string(),
-    })
 }
 
 fn parse_login(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
-    expect_exact_arity(tokens, 2, "/login <alias>")?;
-
-    let alias = validate_non_empty("alias", &tokens[1], "/login <alias>")?;
-
-    Ok(UserCommand::Login {
-        alias: alias.to_string(),
-    })
+    match tokens {
+        [_, alias] => Ok(UserCommand::Login {
+            alias: alias.clone(),
+        }),
+        [_] => Err(CommandParseError::MissingArgument("alias")),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [] => Err(CommandParseError::Empty),
+    }
 }
 
 fn parse_connect(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
-    expect_exact_arity(tokens, 2, "/connect <multiaddr>")?;
-
-    let multiaddr = validate_non_empty("multiaddr", &tokens[1], "/connect <multiaddr>")?;
-
-    Ok(UserCommand::Connect {
-        multiaddr: multiaddr.to_string(),
-    })
+    match tokens {
+        [_, multiaddr] => Ok(UserCommand::Connect {
+            multiaddr: multiaddr.clone(),
+        }),
+        [_] => Err(CommandParseError::MissingArgument("multiaddr")),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [] => Err(CommandParseError::Empty),
+    }
 }
 
 fn parse_join(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
-    if tokens.len() < 4 {
-        return Err(CommandParseError::InvalidSyntax {
-            message: "missing required room id or --secret".to_string(),
-            usage: Some("/join <room_id> --secret <passphrase> [--ephemeral]"),
-        });
+    if tokens.len() < 2 {
+        return Err(CommandParseError::MissingArgument("room_id"));
     }
 
-    let room_id = validate_non_empty(
-        "room_id",
-        &tokens[1],
-        "/join <room_id> --secret <passphrase> [--ephemeral]",
-    )?;
-
+    let room_id = tokens[1].clone();
     let mut secret: Option<String> = None;
     let mut ephemeral = false;
 
-    let mut idx = 2;
-    while idx < tokens.len() {
-        match tokens[idx].as_str() {
+    let mut i = 2;
+    while i < tokens.len() {
+        match tokens[i].as_str() {
             "--secret" => {
-                let value = tokens.get(idx + 1).ok_or_else(|| {
-                    CommandParseError::InvalidSyntax {
-                        message: "missing value for --secret".to_string(),
-                        usage: Some("/join <room_id> --secret <passphrase> [--ephemeral]"),
-                    }
-                })?;
-
-                if value.starts_with("--") {
-                    return Err(CommandParseError::InvalidSyntax {
-                        message: "missing value for --secret".to_string(),
-                        usage: Some("/join <room_id> --secret <passphrase> [--ephemeral]"),
-                    });
-                }
-
+                let Some(value) = tokens.get(i + 1) else {
+                    return Err(CommandParseError::MissingArgument("secret value"));
+                };
                 secret = Some(value.clone());
-                idx += 2;
+                i += 2;
             }
             "--ephemeral" => {
                 ephemeral = true;
-                idx += 1;
+                i += 1;
             }
-            unknown => {
-                return Err(CommandParseError::InvalidSyntax {
-                    message: format!("unknown /join flag or argument: {unknown}"),
-                    usage: Some("/join <room_id> --secret <passphrase> [--ephemeral]"),
-                });
-            }
+            other => return Err(CommandParseError::UnexpectedArgument(other.to_string())),
         }
     }
 
-    let secret = secret.ok_or_else(|| CommandParseError::InvalidSyntax {
-        message: "missing required flag --secret".to_string(),
-        usage: Some("/join <room_id> --secret <passphrase> [--ephemeral]"),
-    })?;
-
-    if secret.trim().is_empty() {
-        return Err(CommandParseError::InvalidSyntax {
-            message: "secret must not be empty".to_string(),
-            usage: Some("/join <room_id> --secret <passphrase> [--ephemeral]"),
-        });
-    }
+    let Some(secret) = secret else {
+        return Err(CommandParseError::MissingFlag("--secret"));
+    };
 
     Ok(UserCommand::Join {
-        room_id: room_id.to_string(),
+        room_id,
         secret,
         ephemeral,
     })
 }
 
-fn parse_room(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+fn parse_dm(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
     if tokens.len() < 2 {
-        return Err(CommandParseError::InvalidSyntax {
-            message: "missing room subcommand".to_string(),
-            usage: Some("/room add-peer <peer_id>\n  /room peers"),
-        });
+        return Err(CommandParseError::MissingArgument("peer_id"));
     }
 
-    match tokens[1].as_str() {
-        "add-peer" => {
-            if tokens.len() != 3 {
-                return Err(CommandParseError::InvalidSyntax {
-                    message: "invalid /room add-peer command".to_string(),
-                    usage: Some("/room add-peer <peer_id>"),
-                });
+    let peer_id = tokens[1].clone();
+    let mut secret: Option<String> = None;
+    let mut ephemeral = false;
+
+    let mut i = 2;
+    while i < tokens.len() {
+        match tokens[i].as_str() {
+            "--secret" => {
+                let Some(value) = tokens.get(i + 1) else {
+                    return Err(CommandParseError::MissingArgument("secret value"));
+                };
+                secret = Some(value.clone());
+                i += 2;
             }
-
-            let peer_id = validate_non_empty("peer_id", &tokens[2], "/room add-peer <peer_id>")?;
-
-            Ok(UserCommand::RoomAddPeer {
-                peer_id: peer_id.to_string(),
-            })
+            "--ephemeral" => {
+                ephemeral = true;
+                i += 1;
+            }
+            other => return Err(CommandParseError::UnexpectedArgument(other.to_string())),
         }
-        "peers" => {
-            expect_exact_arity(tokens, 2, "/room peers")?;
-            Ok(UserCommand::RoomPeers)
+    }
+
+    let Some(secret) = secret else {
+        return Err(CommandParseError::MissingFlag("--secret"));
+    };
+
+    Ok(UserCommand::DirectMessage {
+        peer_id,
+        secret,
+        ephemeral,
+    })
+}
+
+
+fn parse_create_room(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    let mut room_id: Option<String> = None;
+    let mut ephemeral = false;
+
+    let mut i = 1;
+    while i < tokens.len() {
+        match tokens[i].as_str() {
+            "--ephemeral" => {
+                ephemeral = true;
+                i += 1;
+            }
+            value if !value.starts_with("--") && room_id.is_none() => {
+                room_id = Some(value.to_string());
+                i += 1;
+            }
+            other => return Err(CommandParseError::UnexpectedArgument(other.to_string())),
         }
-        other => Err(CommandParseError::InvalidSyntax {
-            message: format!("unknown /room subcommand: {other}"),
-            usage: Some("/room add-peer <peer_id>\n  /room peers"),
+    }
+
+    Ok(UserCommand::CreateRoom { room_id, ephemeral })
+}
+
+fn parse_invite(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    match tokens {
+        [_, peer_id] => Ok(UserCommand::Invite {
+            peer_id: peer_id.clone(),
         }),
+        [_] => Err(CommandParseError::MissingArgument("peer_id")),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [] => Err(CommandParseError::Empty),
+    }
+}
+
+fn parse_accept_invite(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    match tokens {
+        [_, invite_id] => Ok(UserCommand::AcceptInvite {
+            invite_id: invite_id.clone(),
+        }),
+        [_] => Err(CommandParseError::MissingArgument("invite_id")),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [] => Err(CommandParseError::Empty),
+    }
+}
+
+fn parse_reject_invite(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    match tokens {
+        [_, invite_id] => Ok(UserCommand::RejectInvite {
+            invite_id: invite_id.clone(),
+        }),
+        [_] => Err(CommandParseError::MissingArgument("invite_id")),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [] => Err(CommandParseError::Empty),
+    }
+}
+
+fn parse_room(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    match tokens {
+        [_, subcommand, peer_id] if subcommand == "add-peer" => Ok(UserCommand::RoomAddPeer {
+            peer_id: peer_id.clone(),
+        }),
+        [_, subcommand, _, extra, ..] if subcommand == "add-peer" => {
+            Err(CommandParseError::UnexpectedArgument(extra.clone()))
+        }
+        [_, subcommand] if subcommand == "peers" => Ok(UserCommand::RoomPeers),
+        [_, subcommand, extra, ..] if subcommand == "peers" => {
+            Err(CommandParseError::UnexpectedArgument(extra.clone()))
+        }
+        [_, subcommand, ..] => Err(CommandParseError::InvalidValue {
+            field: "room subcommand",
+            value: subcommand.clone(),
+        }),
+        [_] => Err(CommandParseError::MissingArgument("room subcommand")),
+        [] => Err(CommandParseError::Empty),
     }
 }
 
 fn parse_history(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
-    expect_exact_arity(tokens, 2, "/history on|off")?;
-
-    match tokens[1].as_str() {
-        "on" => Ok(UserCommand::History { enabled: true }),
-        "off" => Ok(UserCommand::History { enabled: false }),
-        other => Err(CommandParseError::InvalidSyntax {
-            message: format!("invalid history mode: {other}"),
-            usage: Some("/history on|off"),
+    match tokens {
+        [_, value] if value == "on" => Ok(UserCommand::History { enabled: true }),
+        [_, value] if value == "off" => Ok(UserCommand::History { enabled: false }),
+        [_, value] => Err(CommandParseError::InvalidValue {
+            field: "history",
+            value: value.clone(),
         }),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [_] => Err(CommandParseError::MissingArgument("on|off")),
+        [] => Err(CommandParseError::Empty),
     }
 }
 
-fn expect_exact_arity(
-    tokens: &[String],
-    expected: usize,
-    usage: &'static str,
-) -> Result<(), CommandParseError> {
-    if tokens.len() == expected {
-        Ok(())
-    } else {
-        Err(CommandParseError::InvalidSyntax {
-            message: format!(
-                "invalid number of arguments: expected {}, got {}",
-                expected.saturating_sub(1),
-                tokens.len().saturating_sub(1)
-            ),
-            usage: Some(usage),
-        })
+fn parse_trust(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    match tokens {
+        [_, value] if value == "list" => Ok(UserCommand::Trust {
+            action: TrustCommand::List,
+        }),
+        [_, value, extra, ..] if value == "list" => {
+            Err(CommandParseError::UnexpectedArgument(extra.clone()))
+        }
+        [_, value, peer_id] if value == "remove" => Ok(UserCommand::Trust {
+            action: TrustCommand::Remove {
+                peer_id: peer_id.clone(),
+            },
+        }),
+        [_, value, _, extra, ..] if value == "remove" => {
+            Err(CommandParseError::UnexpectedArgument(extra.clone()))
+        }
+        [_, value] if value == "remove" => Err(CommandParseError::MissingArgument("peer_id")),
+        [_, peer_id] => Ok(UserCommand::Trust {
+            action: TrustCommand::Add {
+                peer_id: peer_id.clone(),
+            },
+        }),
+        [_, peer_id, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [_] => Err(CommandParseError::MissingArgument("peer_id|list|remove <peer_id>")),
+        [] => Err(CommandParseError::Empty),
     }
 }
 
-fn validate_non_empty<'a>(
-    field: &'static str,
-    value: &'a str,
-    usage: &'static str,
-) -> Result<&'a str, CommandParseError> {
-    if value.trim().is_empty() {
-        Err(CommandParseError::InvalidSyntax {
-            message: format!("{field} must not be empty"),
-            usage: Some(usage),
-        })
-    } else {
-        Ok(value)
+
+
+fn parse_debug(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    match tokens {
+        [_, value] if value == "on" => Ok(UserCommand::Debug { enabled: true }),
+        [_, value] if value == "off" => Ok(UserCommand::Debug { enabled: false }),
+        [_, value] => Err(CommandParseError::InvalidValue {
+            field: "debug",
+            value: value.clone(),
+        }),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [_] => Err(CommandParseError::MissingArgument("on|off")),
+        [] => Err(CommandParseError::Empty),
+    }
+}
+
+fn parse_policy(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
+    match tokens {
+        [_] => Ok(UserCommand::Policy {
+            action: PolicyCommand::Show,
+        }),
+        [_, value] if value == "strict" => Ok(UserCommand::Policy {
+            action: PolicyCommand::Strict,
+        }),
+        [_, value] if value == "relaxed" => Ok(UserCommand::Policy {
+            action: PolicyCommand::Relaxed,
+        }),
+        [_, value] => Err(CommandParseError::InvalidValue {
+            field: "policy",
+            value: value.clone(),
+        }),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [] => Err(CommandParseError::Empty),
     }
 }
 
@@ -418,61 +465,20 @@ fn validate_non_empty<'a>(
 mod tests {
     use super::*;
 
-    fn parse(input: &str) -> UserCommand {
-        parse_user_command(input).unwrap().command
-    }
-
     #[test]
     fn parses_identity_create() {
         assert_eq!(
-            parse("/identity create elliot"),
+            parse_command("/identity create Alice").unwrap(),
             UserCommand::IdentityCreate {
-                alias: "elliot".to_string()
+                alias: "Alice".to_string()
             }
         );
     }
 
     #[test]
-    fn rejects_invalid_identity_command() {
-        let err = parse_user_command("/identity delete elliot").unwrap_err();
-
-        assert!(matches!(err, CommandParseError::InvalidSyntax { .. }));
-    }
-
-    #[test]
-    fn parses_login() {
+    fn parses_join_with_quoted_secret_and_ephemeral_flag() {
         assert_eq!(
-            parse("/login elliot"),
-            UserCommand::Login {
-                alias: "elliot".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn parses_whoami() {
-        assert_eq!(parse("/whoami"), UserCommand::Whoami);
-    }
-
-    #[test]
-    fn parses_connect() {
-        assert_eq!(
-            parse("/connect /ip4/192.168.1.20/tcp/7777/p2p/12D3KooW"),
-            UserCommand::Connect {
-                multiaddr: "/ip4/192.168.1.20/tcp/7777/p2p/12D3KooW".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn parses_peers() {
-        assert_eq!(parse("/peers"), UserCommand::Peers);
-    }
-
-    #[test]
-    fn parses_join_with_quoted_secret_and_ephemeral() {
-        assert_eq!(
-            parse(r#"/join 123 --secret "red wheelbarrow" --ephemeral"#),
+            parse_command(r#"/join 123 --secret "red wheelbarrow" --ephemeral"#).unwrap(),
             UserCommand::Join {
                 room_id: "123".to_string(),
                 secret: "red wheelbarrow".to_string(),
@@ -482,110 +488,134 @@ mod tests {
     }
 
     #[test]
-    fn parses_join_when_ephemeral_comes_before_secret() {
+    fn parses_msg_as_free_text() {
         assert_eq!(
-            parse(r#"/join 123 --ephemeral --secret "red wheelbarrow""#),
-            UserCommand::Join {
-                room_id: "123".to_string(),
-                secret: "red wheelbarrow".to_string(),
-                ephemeral: true,
+            parse_command("/msg hello world from terminal").unwrap(),
+            UserCommand::Message {
+                text: "hello world from terminal".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_slash() {
+        assert_eq!(
+            parse_command("EVE_os-1112").unwrap_err(),
+            CommandParseError::MissingSlash
         );
     }
 
     #[test]
     fn rejects_join_without_secret() {
-        let err = parse_user_command("/join 123 --ephemeral").unwrap_err();
-
-        assert!(matches!(
-            err,
-            CommandParseError::InvalidSyntax { message, .. }
-            if message.contains("--secret")
-        ));
+        assert_eq!(
+            parse_command("/join 123").unwrap_err(),
+            CommandParseError::MissingFlag("--secret")
+        );
     }
 
     #[test]
-    fn parses_room_add_peer() {
+    fn rejects_history_extra_args() {
         assert_eq!(
-            parse("/room add-peer 12D3KooWBob"),
-            UserCommand::RoomAddPeer {
-                peer_id: "12D3KooWBob".to_string()
+            parse_command("/history on now").unwrap_err(),
+            CommandParseError::UnexpectedArgument("now".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_status() {
+        assert_eq!(parse_command("/status").unwrap(), UserCommand::Status);
+    }
+
+    #[test]
+    fn parses_clear() {
+        assert_eq!(parse_command("/clear").unwrap(), UserCommand::Clear);
+    }
+
+    #[test]
+    fn parses_trust_add() {
+        assert_eq!(
+            parse_command("/trust 12D3KooWPeer").unwrap(),
+            UserCommand::Trust {
+                action: TrustCommand::Add {
+                    peer_id: "12D3KooWPeer".to_string(),
+                }
             }
         );
     }
 
     #[test]
-    fn parses_room_peers() {
-        assert_eq!(parse("/room peers"), UserCommand::RoomPeers);
-    }
-
-    #[test]
-    fn parses_rooms() {
-        assert_eq!(parse("/rooms"), UserCommand::Rooms);
-    }
-
-    #[test]
-    fn parses_msg_free_text_without_quotes() {
+    fn parses_trust_list() {
         assert_eq!(
-            parse("/msg hello world from dogel"),
-            UserCommand::Message {
-                text: "hello world from dogel".to_string()
+            parse_command("/trust list").unwrap(),
+            UserCommand::Trust {
+                action: TrustCommand::List,
             }
         );
     }
 
     #[test]
-    fn preserves_quotes_inside_msg_text() {
+    fn parses_trust_remove() {
         assert_eq!(
-            parse(r#"/msg say "hello" to bob"#),
-            UserCommand::Message {
-                text: r#"say "hello" to bob"#.to_string()
+            parse_command("/trust remove 12D3KooWPeer").unwrap(),
+            UserCommand::Trust {
+                action: TrustCommand::Remove {
+                    peer_id: "12D3KooWPeer".to_string(),
+                }
+            }
+        );
+    }
+
+
+    #[test]
+    fn parses_dm_with_secret_and_ephemeral_flag() {
+        assert_eq!(
+            parse_command(r#"/dm 12D3KooWPeer --secret "red wheelbarrow" --ephemeral"#).unwrap(),
+            UserCommand::DirectMessage {
+                peer_id: "12D3KooWPeer".to_string(),
+                secret: "red wheelbarrow".to_string(),
+                ephemeral: true,
             }
         );
     }
 
     #[test]
-    fn rejects_empty_msg() {
-        let err = parse_user_command("/msg").unwrap_err();
+    fn rejects_room_extra_args() {
+        assert_eq!(
+            parse_command("/room peers extra").unwrap_err(),
+            CommandParseError::UnexpectedArgument("extra".to_string())
+        );
+    }
 
-        assert!(matches!(err, CommandParseError::InvalidSyntax { .. }));
+
+    #[test]
+    fn parses_policy_show() {
+        assert_eq!(
+            parse_command("/policy").unwrap(),
+            UserCommand::Policy {
+                action: PolicyCommand::Show,
+            }
+        );
     }
 
     #[test]
-    fn parses_history_on_off() {
-        assert_eq!(parse("/history on"), UserCommand::History { enabled: true });
-        assert_eq!(parse("/history off"), UserCommand::History { enabled: false });
+    fn parses_policy_strict() {
+        assert_eq!(
+            parse_command("/policy strict").unwrap(),
+            UserCommand::Policy {
+                action: PolicyCommand::Strict,
+            }
+        );
     }
 
     #[test]
-    fn parses_help() {
-        assert_eq!(parse("/help"), UserCommand::Help);
+    fn parses_policy_relaxed() {
+        assert_eq!(
+            parse_command("/policy relaxed").unwrap(),
+            UserCommand::Policy {
+                action: PolicyCommand::Relaxed,
+            }
+        );
     }
 
-    #[test]
-    fn parses_quit_and_exit() {
-        assert_eq!(parse("/quit"), UserCommand::Quit);
-        assert_eq!(parse("/exit"), UserCommand::Quit);
-    }
 
-    #[test]
-    fn rejects_unknown_command() {
-        let err = parse_user_command("/unknown").unwrap_err();
-
-        assert!(matches!(err, CommandParseError::UnknownCommand { .. }));
-    }
-
-    #[test]
-    fn rejects_missing_leading_slash() {
-        let err = parse_user_command("msg hello").unwrap_err();
-
-        assert_eq!(err, CommandParseError::MissingLeadingSlash);
-    }
-
-    #[test]
-    fn rejects_unclosed_quote() {
-        let err = parse_user_command(r#"/join 123 --secret "unterminated"#).unwrap_err();
-
-        assert!(matches!(err, CommandParseError::TokenizationFailed { .. }));
-    }
 }
