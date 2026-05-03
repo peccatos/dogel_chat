@@ -11,31 +11,41 @@
 - Online invites.
 - Trust store.
 - Strict message policy.
+- Local encrypted message history.
 - Crypto hardening:
   - Argon2id room passphrase KDF;
   - replay cache;
+  - strict protocol version checks;
+  - creator-signed membership for invite-created rooms;
+  - room keys bound to room id, signed membership and protocol version;
   - inbound membership enforcement;
   - KDF caps;
   - identity session lock.
-- Minimal TUI mode via `--tui`.
+- Ratatui TUI mode via `--tui`:
+  - header, session log, input bar and status sidebar;
+  - scrollback with `PgUp`/`PgDn`;
+  - input cursor movement and history;
+  - in-TUI output routing for shell commands;
+  - native password input for identity creation and login;
+  - background P2P diagnostics routed through events.
 - `/doctor`.
 - `/debug on|off`.
+- Phase 13 relay/bootstrap readiness:
+  - `--bootstrap <multiaddr>` startup dialing;
+  - `--relay-server` circuit relay service mode;
+  - `--external-addr <multiaddr>` manual public address announcement;
+  - relay reservation diagnostics in `/doctor` and `/whoami`.
 
 ## Not done
 
-- Full TUI polish.
-- Local encrypted message history.
 - X25519 offline invites.
-- Relay/bootstrap/NAT traversal.
+- AutoNAT/DCUtR hole punching.
+- Production relay operations and abuse controls.
 - Group key rotation.
 - Steganography codecs.
 - Formal audit.
 
 ## Recommended next phase
 
-Phase 12 should either:
-
-1. harden TUI output routing with a real `AppOutput` event bus; or
-2. implement encrypted local history v0.1.1.
-
-Do not start relay/NAT traversal before the UI/event boundaries are cleaner.
+Phase 16 should harden external networking with AutoNAT/DCUtR, relay abuse
+limits and multi-node manual acceptance tests.

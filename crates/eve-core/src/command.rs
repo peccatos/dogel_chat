@@ -7,10 +7,16 @@ use thiserror::Error;
 /// strings, so parsing bugs do not leak into storage, crypto or networking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserCommand {
-    IdentityCreate { alias: String },
-    Login { alias: String },
+    IdentityCreate {
+        alias: String,
+    },
+    Login {
+        alias: String,
+    },
     Whoami,
-    Connect { multiaddr: String },
+    Connect {
+        multiaddr: String,
+    },
     Peers,
     Join {
         room_id: String,
@@ -36,16 +42,28 @@ pub enum UserCommand {
     RejectInvite {
         invite_id: String,
     },
-    RoomAddPeer { peer_id: String },
+    RoomAddPeer {
+        peer_id: String,
+    },
     RoomPeers,
     Rooms,
-    Message { text: String },
-    History { enabled: bool },
-    Trust { action: TrustCommand },
-    Policy { action: PolicyCommand },
+    Message {
+        text: String,
+    },
+    History {
+        enabled: bool,
+    },
+    Trust {
+        action: TrustCommand,
+    },
+    Policy {
+        action: PolicyCommand,
+    },
     Status,
     Doctor,
-    Debug { enabled: bool },
+    Debug {
+        enabled: bool,
+    },
     Clear,
     Help,
     Quit,
@@ -101,10 +119,7 @@ pub enum CommandParseError {
     MissingFlag(&'static str),
 
     #[error("invalid value for {field}: {value}")]
-    InvalidValue {
-        field: &'static str,
-        value: String,
-    },
+    InvalidValue { field: &'static str, value: String },
 }
 
 /// Parse a single interactive shell line into a typed command.
@@ -306,7 +321,6 @@ fn parse_dm(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
     })
 }
 
-
 fn parse_create_room(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
     let mut room_id: Option<String> = None;
     let mut ephemeral = false;
@@ -419,13 +433,13 @@ fn parse_trust(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
                 peer_id: peer_id.clone(),
             },
         }),
-        [_, peer_id, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
-        [_] => Err(CommandParseError::MissingArgument("peer_id|list|remove <peer_id>")),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [_] => Err(CommandParseError::MissingArgument(
+            "peer_id|list|remove <peer_id>",
+        )),
         [] => Err(CommandParseError::Empty),
     }
 }
-
-
 
 fn parse_debug(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
     match tokens {
@@ -565,7 +579,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn parses_dm_with_secret_and_ephemeral_flag() {
         assert_eq!(
@@ -585,7 +598,6 @@ mod tests {
             CommandParseError::UnexpectedArgument("extra".to_string())
         );
     }
-
 
     #[test]
     fn parses_policy_show() {
@@ -616,6 +628,4 @@ mod tests {
             }
         );
     }
-
-
 }

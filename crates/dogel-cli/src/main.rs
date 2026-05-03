@@ -1,34 +1,119 @@
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use crossterm::{
     event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use eve_core::{parse_command, PolicyCommand, TrustCommand, UserCommand};
 use eve_crypto::{
-    decrypt_room_message, derive_room_key, encrypt_room_message, fingerprint_from_public_key,
-    generate_message_id, generate_random_room_key, room_key_fingerprint, sign_bytes,
-    verify_signature,
+    decrypt_room_message, derive_bound_room_key, derive_room_key, encrypt_room_message,
+    fingerprint_from_public_key, generate_message_id, generate_random_room_key,
+    room_key_fingerprint, sign_bytes, verify_signature,
 };
-use eve_p2p::{P2pEvent, P2pHandle};
-use eve_protocol::{PlainMessage, RoomInvite, SignedEncryptedEnvelope};
+use eve_p2p::{P2pConfig, P2pEvent, P2pHandle};
+use eve_protocol::{
+    canonical_peer_list, require_protocol_version, PlainMessage, RoomInvite, RoomMembershipState,
+    SignedEncryptedEnvelope, PROTOCOL_VERSION,
+};
 use eve_storage::{IdentityStore, TrustedPeerRecord, UnlockedIdentity};
+use eve_storage::{RoomHistoryDirection, RoomHistoryEntry};
 use libp2p::{Multiaddr, PeerId};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Terminal,
 };
 use rustyline::{error::ReadlineError, DefaultEditor};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     io::{self, Write},
-    sync::Arc,
+    rc::Rc,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+
+tokio::task_local! {
+    static OUTPUT_CAPTURE: Rc<RefCell<Vec<String>>>;
+}
+
+type SharedOutputSink = Arc<StdMutex<VecDeque<String>>>;
+
+static GLOBAL_OUTPUT_SINK: OnceLock<StdMutex<Option<SharedOutputSink>>> = OnceLock::new();
+
+struct GlobalOutputSinkGuard;
+
+impl GlobalOutputSinkGuard {
+    fn install(sink: SharedOutputSink) -> Self {
+        let cell = GLOBAL_OUTPUT_SINK.get_or_init(|| StdMutex::new(None));
+        if let Ok(mut current) = cell.lock() {
+            *current = Some(sink);
+        }
+        Self
+    }
+}
+
+impl Drop for GlobalOutputSinkGuard {
+    fn drop(&mut self) {
+        if let Some(cell) = GLOBAL_OUTPUT_SINK.get() {
+            if let Ok(mut current) = cell.lock() {
+                *current = None;
+            }
+        }
+    }
+}
+
+fn emit_output_line(line: String) {
+    if OUTPUT_CAPTURE
+        .try_with(|capture| {
+            let mut lines = capture.borrow_mut();
+            for segment in line.split('\n') {
+                lines.push(segment.to_string());
+            }
+        })
+        .is_err()
+    {
+        if let Some(cell) = GLOBAL_OUTPUT_SINK.get() {
+            if let Ok(current) = cell.lock() {
+                if let Some(sink) = current.as_ref() {
+                    if let Ok(mut lines) = sink.lock() {
+                        for segment in line.split('\n') {
+                            lines.push_back(segment.to_string());
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        std::println!("{line}");
+    }
+}
+
+macro_rules! println {
+    () => {
+        emit_output_line(String::new())
+    };
+    ($($arg:tt)*) => {
+        emit_output_line(format!($($arg)*))
+    };
+}
+
+async fn capture_command_output<F, T>(future: F) -> (T, Vec<String>)
+where
+    F: Future<Output = T>,
+{
+    let capture = Rc::new(RefCell::new(Vec::new()));
+    let result = OUTPUT_CAPTURE.scope(Rc::clone(&capture), future).await;
+    let lines = std::mem::take(&mut *capture.borrow_mut());
+    (result, lines)
+}
 
 /// Default v0.1 LAN listen address.
 ///
@@ -46,6 +131,9 @@ struct AppState {
     active_identity: Option<UnlockedIdentity>,
     p2p: Option<P2pHandle>,
     listen_addr: Multiaddr,
+    bootstrap_peers: Vec<Multiaddr>,
+    relay_server: bool,
+    external_addrs: Vec<Multiaddr>,
     rooms: SharedRoomBook,
     invites: SharedInviteBook,
     trust: SharedTrustBook,
@@ -89,7 +177,6 @@ enum InboundTrustStatus {
         old_fingerprint: String,
         new_fingerprint: String,
     },
-
 }
 
 /// Message policy enforced locally before encryption and network transmission.
@@ -155,7 +242,6 @@ impl MessagePolicy {
     }
 }
 
-
 /// Mutable room state shared between the command loop and the inbound P2P event
 /// task.
 ///
@@ -176,10 +262,12 @@ struct RoomBook {
 struct RoomSession {
     room_id: String,
     room_key: [u8; 32],
+    room_seed: Option<[u8; 32]>,
     key_fingerprint: String,
     ephemeral: bool,
     history_enabled: bool,
     members: HashSet<PeerId>,
+    membership: Option<RoomMembershipState>,
 
     /// In-memory replay cache for this room.
     ///
@@ -187,9 +275,49 @@ struct RoomSession {
     /// memory-only for v0.1 because durable history is not implemented yet.
     /// Ephemeral rooms still benefit from rejecting repeated envelopes during a
     /// live session.
-    seen_message_ids: HashSet<String>,
+    replay_cache: ReplayCache,
 }
 
+/// Bounded in-memory replay cache for decrypted message ids.
+#[derive(Debug, Clone)]
+struct ReplayCache {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for ReplayCache {
+    fn default() -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: 4096,
+        }
+    }
+}
+
+impl ReplayCache {
+    fn insert(&mut self, key: String) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
 
 /// Pending online invites received during this process.
 ///
@@ -211,8 +339,10 @@ struct PendingInvite {
     invite_id: String,
     room_id: String,
     room_key: [u8; 32],
+    room_seed: [u8; 32],
     key_fingerprint: String,
     ephemeral: bool,
+    membership: RoomMembershipState,
     sender_alias: String,
     sender_peer_id: PeerId,
     sender_fingerprint: String,
@@ -220,11 +350,14 @@ struct PendingInvite {
 }
 
 impl AppState {
-    fn new(listen_addr: Multiaddr) -> Self {
+    fn new(config: &StartupConfig) -> Self {
         Self {
             active_identity: None,
             p2p: None,
-            listen_addr,
+            listen_addr: config.listen_addr.clone(),
+            bootstrap_peers: config.bootstrap_peers.clone(),
+            relay_server: config.relay_server,
+            external_addrs: config.external_addrs.clone(),
             rooms: Arc::new(Mutex::new(RoomBook::default())),
             invites: Arc::new(Mutex::new(InviteBook::default())),
             trust: Arc::new(Mutex::new(TrustBook::default())),
@@ -276,6 +409,9 @@ async fn build_prompt(state: &AppState) -> String {
 #[derive(Debug, Clone)]
 struct StartupConfig {
     listen_addr: Multiaddr,
+    bootstrap_peers: Vec<Multiaddr>,
+    relay_server: bool,
+    external_addrs: Vec<Multiaddr>,
     tui: bool,
 }
 
@@ -283,7 +419,7 @@ struct StartupConfig {
 async fn main() -> Result<()> {
     let config = parse_startup_config()?;
     let store = IdentityStore::default().context("failed to initialize local identity store")?;
-    let mut state = AppState::new(config.listen_addr.clone());
+    let mut state = AppState::new(&config);
 
     if config.tui {
         run_tui_loop(&store, &mut state).await?;
@@ -297,13 +433,15 @@ async fn main() -> Result<()> {
 
 /// Classic line-oriented shell mode.
 ///
-/// This remains the primary debugging mode. Phase 11 adds TUI as an additional
-/// frontend, not as a replacement for the stable shell.
+/// This remains the primary debugging mode. The TUI is an additional frontend,
+/// not a replacement for the stable shell.
 async fn run_shell_loop(store: &IdentityStore, state: &mut AppState) -> Result<()> {
-    println!("dogel.bin v0.1 phase 11");
-    println!("interactive shell + encrypted P2P messages + trust + online invites");
+    println!("dogel.bin v0.1 phase 15");
+    println!("interactive shell + encrypted P2P messages + trust + online invites + relay/bootstrap + TUI");
     println!("config root: {}", store.root().display());
     println!("listen: {}", state.listen_addr);
+    println!("relay server: {}", state.relay_server);
+    println!("bootstrap peers: {}", state.bootstrap_peers.len());
     println!("type /help for commands, /quit to exit");
     println!();
 
@@ -320,7 +458,7 @@ async fn run_shell_loop(store: &IdentityStore, state: &mut AppState) -> Result<(
                 }
 
                 if !line.starts_with('/') {
-                    if let Err(err) = send_room_message(line, state).await {
+                    if let Err(err) = send_room_message(line, store, state).await {
                         println!("error: {err}");
                     }
                     continue;
@@ -364,13 +502,11 @@ async fn run_shell_loop(store: &IdentityStore, state: &mut AppState) -> Result<(
     Ok(())
 }
 
-/// Minimal TUI frontend.
+/// Ratatui frontend.
 ///
-/// This is deliberately conservative: it reuses the same command parser and
-/// command handlers as shell mode. It does not yet have a full output-router
-/// abstraction, so some low-level network diagnostics can still be printed by
-/// background tasks. That is acceptable for Phase 11; the important part is
-/// establishing a working alternate-screen UI without touching crypto or P2P.
+/// The TUI reuses the same command parser and command handlers as shell mode.
+/// Command output is captured into the session log instead of printing directly
+/// over the alternate-screen layout.
 async fn run_tui_loop(store: &IdentityStore, state: &mut AppState) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
 
@@ -394,58 +530,35 @@ async fn run_tui_loop_inner(
     state: &mut AppState,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
-    let mut input = String::new();
-    let mut log: VecDeque<String> = VecDeque::new();
+    let mut tui = TuiState::new();
+    let output_sink = Arc::new(StdMutex::new(VecDeque::new()));
+    let _output_guard = GlobalOutputSinkGuard::install(Arc::clone(&output_sink));
 
-    log.push_back("dogel.bin v0.1 phase 11 minimal TUI".to_string());
-    log.push_back("type /help, /doctor, /quit; ordinary text sends to active room".to_string());
-    log.push_back("links, multiline paste and bursts remain blocked by local policy".to_string());
+    tui.push_log("dogel.bin v0.1 phase 15 TUI".to_string());
+    tui.push_log("type /help, /doctor, /quit; ordinary text sends to active room".to_string());
+    tui.push_log("PgUp/PgDn scroll log, Up/Down browse input history".to_string());
 
     loop {
-        let prompt = build_prompt(state).await;
-        let title = build_tui_title(state).await;
+        tui.drain_output_sink(&output_sink);
+
+        let prompt = if let Some(prompt) = tui.secret_prompt() {
+            prompt.to_string()
+        } else {
+            build_prompt(state).await
+        };
+        let snapshot = build_tui_snapshot(state).await;
 
         terminal
             .draw(|frame| {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(3),
-                        Constraint::Length(3),
-                    ])
-                    .split(frame.size());
-
-                let header = Paragraph::new(title.clone())
-                    .block(Block::default().title(" dogel.bin ").borders(Borders::ALL))
-                    .wrap(Wrap { trim: true });
-                frame.render_widget(header, chunks[0]);
-
-                let lines = log
-                    .iter()
-                    .rev()
-                    .take(chunks[1].height.saturating_sub(2) as usize)
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let messages = Paragraph::new(lines)
-                    .block(Block::default().title(" session ").borders(Borders::ALL))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(messages, chunks[1]);
-
-                let input_line = format!("{prompt}{input}");
-                let input_widget = Paragraph::new(input_line)
-                    .block(Block::default().title(" input ").borders(Borders::ALL))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(input_widget, chunks[2]);
+                render_tui(frame, &snapshot, &tui, &prompt);
             })
             .context("failed to draw TUI frame")?;
 
         if !event::poll(Duration::from_millis(80)).context("failed to poll terminal events")? {
             continue;
         }
+
+        tui.drain_output_sink(&output_sink);
 
         let CrosstermEvent::Key(key) = event::read().context("failed to read terminal event")?
         else {
@@ -458,51 +571,98 @@ async fn run_tui_loop_inner(
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                log.push_back("^C ignored; use /quit".to_string());
+                tui.push_log("^C ignored; use /quit".to_string());
             }
             KeyCode::Esc => {
-                log.push_back("ESC ignored; use /quit".to_string());
+                if tui.cancel_secret_flow() {
+                    tui.push_log("secret input cancelled".to_string());
+                } else {
+                    tui.push_log("ESC ignored; use /quit".to_string());
+                }
             }
             KeyCode::Backspace => {
-                input.pop();
+                tui.backspace();
+            }
+            KeyCode::Delete => {
+                tui.delete();
+            }
+            KeyCode::Left => {
+                tui.move_cursor_left();
+            }
+            KeyCode::Right => {
+                tui.move_cursor_right();
+            }
+            KeyCode::Home => {
+                tui.input_cursor = 0;
+            }
+            KeyCode::End => {
+                tui.input_cursor = tui.input.len();
+            }
+            KeyCode::Up => {
+                tui.history_prev();
+            }
+            KeyCode::Down => {
+                tui.history_next();
+            }
+            KeyCode::PageUp => {
+                tui.scroll_up();
+            }
+            KeyCode::PageDown => {
+                tui.scroll_down();
             }
             KeyCode::Enter => {
-                let line = input.trim().to_string();
-                input.clear();
+                if tui.secret_flow.is_some() {
+                    handle_tui_secret_enter(&mut tui, store, state).await;
+                    continue;
+                }
+
+                let line = tui.input.trim().to_string();
+                tui.commit_input(true);
 
                 if line.is_empty() {
                     continue;
                 }
 
-                push_tui_log(&mut log, format!("> {line}"));
+                tui.push_log(format!("> {line}"));
 
                 if !line.starts_with('/') {
-                    match send_room_message(&line, state).await {
-                        Ok(()) => push_tui_log(&mut log, "message submitted".to_string()),
-                        Err(err) => push_tui_log(&mut log, format!("error: {err}")),
+                    let (result, lines) =
+                        capture_command_output(send_room_message(&line, store, state)).await;
+                    tui.push_lines(lines);
+                    if let Err(err) = result {
+                        tui.push_log(format!("error: {err}"));
                     }
                     continue;
                 }
 
                 match parse_command(&line) {
                     Ok(UserCommand::Quit) => {
-                        push_tui_log(&mut log, "bye".to_string());
+                        tui.push_log("bye".to_string());
                         break;
                     }
                     Ok(UserCommand::Clear) => {
-                        log.clear();
+                        tui.clear_log();
                     }
-                    Ok(UserCommand::Doctor) => {
-                        let report = build_doctor_report(state, store).await?;
-                        for line in report {
-                            push_tui_log(&mut log, line);
+                    Ok(UserCommand::IdentityCreate { alias }) => {
+                        tui.start_secret_flow(TuiSecretFlow::CreateIdentity {
+                            alias,
+                            first_password: None,
+                        });
+                    }
+                    Ok(UserCommand::Login { alias }) => {
+                        if state.active_identity.is_some() {
+                            tui.push_log(
+                                "error: an identity is already unlocked in this process"
+                                    .to_string(),
+                            );
+                        } else {
+                            tui.start_secret_flow(TuiSecretFlow::Login { alias });
                         }
                     }
-                    Ok(command) => match handle_command(command, store, state).await {
-                        Ok(()) => push_tui_log(&mut log, "ok".to_string()),
-                        Err(err) => push_tui_log(&mut log, format!("error: {err}")),
-                    },
-                    Err(err) => push_tui_log(&mut log, format!("parse error: {err}")),
+                    Ok(command) => {
+                        run_tui_command(&mut tui, command, store, state).await;
+                    }
+                    Err(err) => tui.push_log(format!("parse error: {err}")),
                 }
             }
             KeyCode::Char(ch) => {
@@ -510,7 +670,7 @@ async fn run_tui_loop_inner(
                 // single-line only by construction; we additionally avoid
                 // accepting control-modified characters as text.
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                    input.push(ch);
+                    tui.insert_char(ch);
                 }
             }
             _ => {}
@@ -520,23 +680,302 @@ async fn run_tui_loop_inner(
     Ok(())
 }
 
-fn push_tui_log(log: &mut VecDeque<String>, line: String) {
-    log.push_back(line);
-    while log.len() > 500 {
-        log.pop_front();
+async fn run_tui_command(
+    tui: &mut TuiState,
+    command: UserCommand,
+    store: &IdentityStore,
+    state: &mut AppState,
+) {
+    let (result, lines) = capture_command_output(handle_command(command, store, state)).await;
+    tui.push_lines(lines);
+    if let Err(err) = result {
+        tui.push_log(format!("error: {err}"));
     }
 }
 
-async fn build_tui_title(state: &AppState) -> String {
+async fn handle_tui_secret_enter(tui: &mut TuiState, store: &IdentityStore, state: &mut AppState) {
+    let Some(flow) = tui.secret_flow.take() else {
+        return;
+    };
+
+    let secret = tui.take_input(false);
+    match flow {
+        TuiSecretFlow::CreateIdentity {
+            alias,
+            first_password: None,
+        } => {
+            tui.secret_flow = Some(TuiSecretFlow::CreateIdentity {
+                alias,
+                first_password: Some(secret),
+            });
+        }
+        TuiSecretFlow::CreateIdentity {
+            alias,
+            first_password: Some(password),
+        } => {
+            if password != secret {
+                tui.push_log("error: passwords do not match".to_string());
+                return;
+            }
+
+            let (result, lines) =
+                capture_command_output(create_identity_with_password(&alias, &password, store))
+                    .await;
+            tui.push_lines(lines);
+            if let Err(err) = result {
+                tui.push_log(format!("error: {err}"));
+            }
+        }
+        TuiSecretFlow::Login { alias } => {
+            let (result, lines) =
+                capture_command_output(login_with_password(&alias, &secret, store, state)).await;
+            tui.push_lines(lines);
+            if let Err(err) = result {
+                tui.push_log(format!("error: {err}"));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TuiSecretFlow {
+    CreateIdentity {
+        alias: String,
+        first_password: Option<String>,
+    },
+    Login {
+        alias: String,
+    },
+}
+
+struct TuiState {
+    input: String,
+    input_cursor: usize,
+    input_history: Vec<String>,
+    history_cursor: Option<usize>,
+    log: VecDeque<String>,
+    log_scroll: usize,
+    secret_flow: Option<TuiSecretFlow>,
+}
+
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            input_cursor: 0,
+            input_history: Vec::new(),
+            history_cursor: None,
+            log: VecDeque::new(),
+            log_scroll: 0,
+            secret_flow: None,
+        }
+    }
+
+    fn push_log(&mut self, line: String) {
+        self.log.push_back(line);
+        while self.log.len() > 1000 {
+            self.log.pop_front();
+        }
+        self.log_scroll = 0;
+    }
+
+    fn push_lines(&mut self, lines: Vec<String>) {
+        for line in lines {
+            self.push_log(line);
+        }
+    }
+
+    fn drain_output_sink(&mut self, sink: &SharedOutputSink) {
+        let mut drained = Vec::new();
+        if let Ok(mut lines) = sink.lock() {
+            while let Some(line) = lines.pop_front() {
+                drained.push(line);
+            }
+        }
+
+        for line in drained {
+            self.push_log(line);
+        }
+    }
+
+    fn clear_log(&mut self) {
+        self.log.clear();
+        self.log_scroll = 0;
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.input.insert(self.input_cursor, ch);
+        self.input_cursor += ch.len_utf8();
+        self.history_cursor = None;
+    }
+
+    fn backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+
+        let previous = self.input[..self.input_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.input.replace_range(previous..self.input_cursor, "");
+        self.input_cursor = previous;
+        self.history_cursor = None;
+    }
+
+    fn delete(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+
+        let next = self.input[self.input_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| self.input_cursor + offset)
+            .unwrap_or(self.input.len());
+        self.input.replace_range(self.input_cursor..next, "");
+        self.history_cursor = None;
+    }
+
+    fn move_cursor_left(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        self.input_cursor = self.input[..self.input_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    fn move_cursor_right(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        self.input_cursor = self.input[self.input_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| self.input_cursor + offset)
+            .unwrap_or(self.input.len());
+    }
+
+    fn take_input(&mut self, record_history: bool) -> String {
+        let line = self.input.trim().to_string();
+        if record_history && !line.is_empty() && self.input_history.last() != Some(&line) {
+            self.input_history.push(line);
+            if self.input_history.len() > 200 {
+                self.input_history.remove(0);
+            }
+        }
+        let input = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
+        self.history_cursor = None;
+        input
+    }
+
+    fn commit_input(&mut self, record_history: bool) {
+        let _ = self.take_input(record_history);
+    }
+
+    fn start_secret_flow(&mut self, flow: TuiSecretFlow) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.history_cursor = None;
+        self.secret_flow = Some(flow);
+    }
+
+    fn cancel_secret_flow(&mut self) -> bool {
+        let had_flow = self.secret_flow.take().is_some();
+        if had_flow {
+            self.input.clear();
+            self.input_cursor = 0;
+            self.history_cursor = None;
+        }
+        had_flow
+    }
+
+    fn secret_prompt(&self) -> Option<&'static str> {
+        match self.secret_flow.as_ref()? {
+            TuiSecretFlow::CreateIdentity {
+                first_password: None,
+                ..
+            } => Some("Password: "),
+            TuiSecretFlow::CreateIdentity {
+                first_password: Some(_),
+                ..
+            } => Some("Confirm password: "),
+            TuiSecretFlow::Login { .. } => Some("Password: "),
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+
+        let next = match self.history_cursor {
+            Some(index) => index.saturating_sub(1),
+            None => self.input_history.len() - 1,
+        };
+        self.history_cursor = Some(next);
+        self.input = self.input_history[next].clone();
+        self.input_cursor = self.input.len();
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+
+        if index + 1 >= self.input_history.len() {
+            self.history_cursor = None;
+            self.input.clear();
+            self.input_cursor = 0;
+        } else {
+            let next = index + 1;
+            self.history_cursor = Some(next);
+            self.input = self.input_history[next].clone();
+            self.input_cursor = self.input.len();
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        self.log_scroll = (self.log_scroll + 8).min(self.log.len().saturating_sub(1));
+    }
+
+    fn scroll_down(&mut self) {
+        self.log_scroll = self.log_scroll.saturating_sub(8);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TuiSnapshot {
+    alias: String,
+    room: String,
+    room_count: usize,
+    peer_count: usize,
+    trust_count: usize,
+    invite_count: usize,
+    relay_server: bool,
+    relay_reservations: usize,
+    relayed_addrs: usize,
+    bootstrap_peers: usize,
+    policy: String,
+    debug: bool,
+}
+
+async fn build_tui_snapshot(state: &AppState) -> TuiSnapshot {
     let alias = state
         .active_identity
         .as_ref()
         .map(|identity| identity.alias.as_str())
-        .unwrap_or("no-identity");
+        .unwrap_or("no-identity")
+        .to_string();
 
-    let room = {
+    let (room, room_count) = {
         let rooms = state.rooms.lock().await;
-        rooms
+        let room = rooms
             .active_room
             .as_ref()
             .and_then(|room_id| rooms.rooms.get(room_id))
@@ -547,12 +986,20 @@ async fn build_tui_title(state: &AppState) -> String {
                     room.room_id.clone()
                 }
             })
-            .unwrap_or_else(|| "no-room".to_string())
+            .unwrap_or_else(|| "no-room".to_string());
+        (room, rooms.rooms.len())
     };
 
-    let peer_count = match state.p2p.as_ref() {
-        Some(p2p) => p2p.connected_peers().await.map(|peers| peers.len()).unwrap_or(0),
-        None => 0,
+    let (peer_count, relay_reservations, relayed_addrs) = match state.p2p.as_ref() {
+        Some(p2p) => match p2p.diagnostics().await {
+            Ok(diagnostics) => (
+                diagnostics.connected_peers.len(),
+                diagnostics.relay_reservations.len(),
+                diagnostics.relayed_addrs.len(),
+            ),
+            Err(_) => (0, 0, 0),
+        },
+        None => (0, 0, 0),
     };
 
     let trust_count = {
@@ -560,11 +1007,189 @@ async fn build_tui_title(state: &AppState) -> String {
         trust.observed.len()
     };
 
-    format!(
-        "identity: {alias} | room: {room} | peers: {peer_count} | trust: {trust_count} | policy: {} | debug: {}",
-        state.message_policy.mode_name(),
-        if state.debug_enabled { "on" } else { "off" }
-    )
+    let invite_count = {
+        let invites = state.invites.lock().await;
+        invites.pending.len()
+    };
+
+    TuiSnapshot {
+        alias,
+        room,
+        room_count,
+        peer_count,
+        trust_count,
+        invite_count,
+        relay_server: state.relay_server,
+        relay_reservations,
+        relayed_addrs,
+        bootstrap_peers: state.bootstrap_peers.len(),
+        policy: state.message_policy.mode_name().to_string(),
+        debug: state.debug_enabled,
+    }
+}
+
+fn render_tui(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &TuiSnapshot,
+    tui: &TuiState,
+    prompt: &str,
+) {
+    let area = frame.size();
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_tui_header(frame, root[0], snapshot);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(40), Constraint::Length(32)])
+        .split(root[1]);
+
+    render_tui_log(frame, body[0], tui);
+    render_tui_sidebar(frame, body[1], snapshot);
+    render_tui_input(frame, root[2], prompt, tui);
+    render_tui_footer(frame, root[3]);
+}
+
+fn render_tui_header(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnapshot) {
+    let title = vec![Line::from(vec![
+        Span::styled(
+            " dogel.bin ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            &snapshot.alias,
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  room "),
+        Span::styled(&snapshot.room, Style::default().fg(Color::Yellow)),
+        Span::raw("  policy "),
+        Span::styled(&snapshot.policy, Style::default().fg(Color::Green)),
+    ])];
+
+    let header = Paragraph::new(title)
+        .block(Block::default().borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(header, area);
+}
+
+fn render_tui_log(frame: &mut ratatui::Frame<'_>, area: Rect, tui: &TuiState) {
+    let visible = area.height.saturating_sub(2) as usize;
+    let end = tui.log.len().saturating_sub(tui.log_scroll);
+    let start = end.saturating_sub(visible);
+
+    let items: Vec<ListItem> = tui
+        .log
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|line| {
+            let style = if line.starts_with("error:") || line.starts_with("parse error:") {
+                Style::default().fg(Color::Red)
+            } else if line.starts_with('>') {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(line.clone(), style)))
+        })
+        .collect();
+
+    let title = if tui.log_scroll == 0 {
+        " session "
+    } else {
+        " session scrolled "
+    };
+
+    let log = List::new(items).block(Block::default().title(title).borders(Borders::ALL));
+    frame.render_widget(log, area);
+}
+
+fn render_tui_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnapshot) {
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Network",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(format!("peers: {}", snapshot.peer_count)),
+        Line::from(format!("bootstrap: {}", snapshot.bootstrap_peers)),
+        Line::from(format!("relay server: {}", snapshot.relay_server)),
+        Line::from(format!("reservations: {}", snapshot.relay_reservations)),
+        Line::from(format!("relayed addrs: {}", snapshot.relayed_addrs)),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "State",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(format!("rooms: {}", snapshot.room_count)),
+        Line::from(format!("invites: {}", snapshot.invite_count)),
+        Line::from(format!("trust: {}", snapshot.trust_count)),
+        Line::from(format!("debug: {}", snapshot.debug)),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Commands",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("/login <alias>"),
+        Line::from("/whoami"),
+        Line::from("/connect <addr>"),
+        Line::from("/create-room --ephemeral"),
+        Line::from("/invite <peer>"),
+        Line::from("/doctor"),
+    ];
+
+    let sidebar = Paragraph::new(lines)
+        .block(Block::default().title(" status ").borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(sidebar, area);
+}
+
+fn render_tui_input(frame: &mut ratatui::Frame<'_>, area: Rect, prompt: &str, tui: &TuiState) {
+    let visible_input = if tui.secret_flow.is_some() {
+        "*".repeat(tui.input.chars().count())
+    } else {
+        tui.input.clone()
+    };
+    let input_line = format!("{prompt}{visible_input}");
+    let input = Paragraph::new(input_line)
+        .block(Block::default().title(" input ").borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(input, area);
+
+    let cursor_x = area
+        .x
+        .saturating_add(1)
+        .saturating_add(prompt.len() as u16)
+        .saturating_add(tui.input[..tui.input_cursor].chars().count() as u16);
+    let cursor_y = area.y.saturating_add(1);
+    if cursor_x < area.x.saturating_add(area.width.saturating_sub(1)) {
+        frame.set_cursor(cursor_x, cursor_y);
+    }
+}
+
+fn render_tui_footer(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(Color::Cyan)),
+        Span::raw(" send/run  "),
+        Span::styled("PgUp/PgDn", Style::default().fg(Color::Cyan)),
+        Span::raw(" scroll  "),
+        Span::styled("Up/Down", Style::default().fg(Color::Cyan)),
+        Span::raw(" history  "),
+        Span::styled("/clear", Style::default().fg(Color::Cyan)),
+        Span::raw(" clear log"),
+    ]));
+    frame.render_widget(footer, area);
 }
 
 fn release_session_lock_if_needed(store: &IdentityStore, state: &mut AppState) {
@@ -575,6 +1200,106 @@ fn release_session_lock_if_needed(store: &IdentityStore, state: &mut AppState) {
     }
 }
 
+async fn create_identity_with_password(
+    alias: &str,
+    password: &str,
+    store: &IdentityStore,
+) -> Result<()> {
+    validate_new_password(password)?;
+
+    let created = store
+        .create_identity(alias, password)
+        .with_context(|| format!("failed to create identity '{alias}'"))?;
+
+    println!("created identity:");
+    println!("  alias: {}", created.alias);
+    println!("  peer_id: {}", created.peer_id);
+    println!("  fingerprint: {}", created.fingerprint);
+    println!("  path: {}", created.identity_dir.display());
+    Ok(())
+}
+
+async fn login_with_password(
+    alias: &str,
+    password: &str,
+    store: &IdentityStore,
+    state: &mut AppState,
+) -> Result<()> {
+    if state.active_identity.is_some() {
+        anyhow::bail!("an identity is already unlocked in this process");
+    }
+
+    let unlocked = store
+        .unlock_identity(alias, password)
+        .with_context(|| format!("failed to unlock identity '{alias}'"))?;
+
+    // Phase 9 hardening: prevent accidental duplicate use of the same
+    // libp2p identity in two local dogel.bin processes. Two live
+    // processes with the same PeerId produce confusing handshakes and
+    // weaken the operational security model.
+    store
+        .acquire_identity_lock(&unlocked.alias)
+        .with_context(|| {
+            format!(
+                "failed to acquire session lock for identity '{}'",
+                unlocked.alias
+            )
+        })?;
+
+    println!("unlocked identity:");
+    println!("  alias: {}", unlocked.alias);
+    println!("  peer_id: {}", unlocked.peer_id);
+    println!("  fingerprint: {}", unlocked.fingerprint);
+
+    // Start libp2p only after successful identity unlock. This is
+    // important: the network PeerId must be derived from the encrypted
+    // identity, not generated freshly every process start.
+    let p2p_config = P2pConfig {
+        listen_addr: state.listen_addr.clone(),
+        bootstrap_peers: state.bootstrap_peers.clone(),
+        relay_server: state.relay_server,
+        external_addrs: state.external_addrs.clone(),
+    };
+    let start_result = P2pHandle::start(unlocked.network_keypair.clone(), p2p_config).await;
+
+    let (p2p, p2p_events) = match start_result {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = store.release_identity_lock(&unlocked.alias);
+            return Err(err).context("failed to start libp2p runtime");
+        }
+    };
+
+    {
+        let mut trust = state.trust.lock().await;
+        trust.identity_alias = Some(unlocked.alias.clone());
+        trust.observed.clear();
+    }
+
+    spawn_p2p_event_task(
+        p2p_events,
+        Arc::clone(&state.rooms),
+        Arc::clone(&state.invites),
+        Arc::clone(&state.trust),
+        store.clone(),
+    );
+
+    println!("p2p runtime started:");
+    println!("  local_peer_id: {}", p2p.local_peer_id());
+    println!("  listen: {}", state.listen_addr);
+    println!("  relay_server: {}", state.relay_server);
+    println!("  bootstrap peers: {}", state.bootstrap_peers.len());
+    if !state.bootstrap_peers.is_empty() && !state.relay_server {
+        println!("  relay reservations will be requested after bootstrap dial");
+    }
+    println!("  use /whoami after [p2p] listening appears to copy full multiaddr");
+
+    state.session_lock_alias = Some(unlocked.alias.clone());
+    state.p2p = Some(p2p);
+    state.active_identity = Some(unlocked);
+    Ok(())
+}
+
 async fn handle_command(
     command: UserCommand,
     store: &IdentityStore,
@@ -583,82 +1308,14 @@ async fn handle_command(
     match command {
         UserCommand::IdentityCreate { alias } => {
             let password = prompt_new_password()?;
-
-            let created = store
-                .create_identity(&alias, &password)
-                .with_context(|| format!("failed to create identity '{alias}'"))?;
-
-            println!("created identity:");
-            println!("  alias: {}", created.alias);
-            println!("  peer_id: {}", created.peer_id);
-            println!("  fingerprint: {}", created.fingerprint);
-            println!("  path: {}", created.identity_dir.display());
+            create_identity_with_password(&alias, &password, store).await?;
         }
 
         UserCommand::Login { alias } => {
-            if state.active_identity.is_some() {
-                anyhow::bail!("an identity is already unlocked in this process");
-            }
-
-            let password = rpassword::prompt_password("Password: ")
-                .context("failed to read password")?;
-
-            let unlocked = store
-                .unlock_identity(&alias, &password)
-                .with_context(|| format!("failed to unlock identity '{alias}'"))?;
-
-            // Phase 9 hardening: prevent accidental duplicate use of the same
-            // libp2p identity in two local dogel.bin processes. Two live
-            // processes with the same PeerId produce confusing handshakes and
-            // weaken the operational security model.
-            store
-                .acquire_identity_lock(&unlocked.alias)
-                .with_context(|| format!("failed to acquire session lock for identity '{}'", unlocked.alias))?;
-
-            println!("unlocked identity:");
-            println!("  alias: {}", unlocked.alias);
-            println!("  peer_id: {}", unlocked.peer_id);
-            println!("  fingerprint: {}", unlocked.fingerprint);
-
-            // Start libp2p only after successful identity unlock. This is
-            // important: the network PeerId must be derived from the encrypted
-            // identity, not generated freshly every process start.
-            let start_result =
-                P2pHandle::start(unlocked.network_keypair.clone(), state.listen_addr.clone())
-                    .await;
-
-            let (p2p, p2p_events) = match start_result {
-                Ok(value) => value,
-                Err(err) => {
-                    let _ = store.release_identity_lock(&unlocked.alias);
-                    return Err(err).context("failed to start libp2p runtime");
-                }
-            };
-
-            {
-                let mut trust = state.trust.lock().await;
-                trust.identity_alias = Some(unlocked.alias.clone());
-                trust.observed.clear();
-            }
-
-            spawn_p2p_event_task(
-                p2p_events,
-                Arc::clone(&state.rooms),
-                Arc::clone(&state.invites),
-                Arc::clone(&state.trust),
-                store.clone(),
-            );
-
-            println!("p2p runtime started:");
-            println!("  local_peer_id: {}", p2p.local_peer_id());
-            println!("  listen: {}", state.listen_addr);
-            println!("  use /whoami after [p2p] listening appears to copy full multiaddr");
-
-            state.session_lock_alias = Some(unlocked.alias.clone());
-            state.p2p = Some(p2p);
-            state.active_identity = Some(unlocked);
+            let password =
+                rpassword::prompt_password("Password: ").context("failed to read password")?;
+            login_with_password(&alias, &password, store, state).await?;
         }
-
         UserCommand::Whoami => {
             let Some(identity) = state.active_identity.as_ref() else {
                 println!("error: no active identity");
@@ -674,15 +1331,25 @@ async fn handle_command(
             println!("listen:");
 
             if let Some(p2p) = state.p2p.as_ref() {
-                let addrs = p2p.listen_addrs().await?;
-                if addrs.is_empty() {
+                let diagnostics = p2p.diagnostics().await?;
+                if diagnostics.listen_addrs.is_empty() {
                     println!("  swarm started, but no listen address is confirmed yet");
                 } else {
-                    for addr in addrs {
+                    for addr in diagnostics.listen_addrs {
                         println!(
                             "  {}",
                             addr.with(libp2p::multiaddr::Protocol::P2p(p2p.local_peer_id()))
                         );
+                    }
+                }
+
+                if diagnostics.relayed_addrs.is_empty() {
+                    println!("relayed listen:");
+                    println!("  none");
+                } else {
+                    println!("relayed listen:");
+                    for addr in diagnostics.relayed_addrs {
+                        println!("  {addr}");
                     }
                 }
             } else {
@@ -744,8 +1411,8 @@ async fn handle_command(
             };
 
             validate_room_id(&room_id)?;
-            let room_key = derive_room_key(&room_id, &secret)
-                .context("failed to derive Argon2id room key")?;
+            let room_key =
+                derive_room_key(&room_id, &secret).context("failed to derive Argon2id room key")?;
             let key_fingerprint = room_key_fingerprint(&room_key);
             let self_peer_id = p2p.local_peer_id();
 
@@ -782,11 +1449,13 @@ async fn handle_command(
             let session = RoomSession {
                 room_id: room_id.clone(),
                 room_key,
+                room_seed: None,
                 key_fingerprint: key_fingerprint.clone(),
                 ephemeral,
                 history_enabled: false,
                 members,
-                seen_message_ids: HashSet::new(),
+                membership: None,
+                replay_cache: ReplayCache::default(),
             };
 
             rooms.rooms.insert(room_id.clone(), session);
@@ -831,14 +1500,19 @@ async fn handle_command(
             }
 
             let room_id = deterministic_dm_room_id(self_peer, remote_peer);
-            let room_key = derive_room_key(&room_id, &secret)
-                .context("failed to derive Argon2id room key")?;
+            let room_key =
+                derive_room_key(&room_id, &secret).context("failed to derive Argon2id room key")?;
             let key_fingerprint = room_key_fingerprint(&room_key);
 
             let mut rooms = state.rooms.lock().await;
 
             if rooms.rooms.contains_key(&room_id) {
-                let (existing_ephemeral, existing_history_enabled, existing_key_fingerprint, member_count) = {
+                let (
+                    existing_ephemeral,
+                    existing_history_enabled,
+                    existing_key_fingerprint,
+                    member_count,
+                ) = {
                     let existing = rooms
                         .rooms
                         .get_mut(&room_id)
@@ -879,11 +1553,13 @@ async fn handle_command(
             let session = RoomSession {
                 room_id: room_id.clone(),
                 room_key,
+                room_seed: None,
                 key_fingerprint: key_fingerprint.clone(),
                 ephemeral,
                 history_enabled: false,
                 members,
-                seen_message_ids: HashSet::new(),
+                membership: None,
+                replay_cache: ReplayCache::default(),
             };
 
             rooms.rooms.insert(room_id.clone(), session);
@@ -898,8 +1574,15 @@ async fn handle_command(
             println!("room key fingerprint: {key_fingerprint}");
         }
 
-
         UserCommand::CreateRoom { room_id, ephemeral } => {
+            let Some(identity) = state.active_identity.as_ref() else {
+                println!("error: no active identity");
+                println!();
+                println!("hint:");
+                println!("  /login <alias>");
+                return Ok(());
+            };
+
             let Some(p2p) = state.p2p.as_ref() else {
                 println!("error: p2p runtime is not started");
                 println!();
@@ -911,12 +1594,19 @@ async fn handle_command(
             let room_id = room_id.unwrap_or_else(generate_invite_room_id);
             validate_room_id(&room_id)?;
 
-            let room_key = generate_random_room_key();
-            let key_fingerprint = room_key_fingerprint(&room_key);
+            let room_seed = generate_random_room_key();
             let self_peer = p2p.local_peer_id();
 
             let mut members = HashSet::new();
             members.insert(self_peer);
+            let membership = build_membership_state(
+                identity,
+                &room_id,
+                canonical_peer_list(members.iter().map(|peer| peer.to_string())),
+            )?;
+            let room_key =
+                derive_bound_room_key(&room_id, &membership.peers, &room_seed, PROTOCOL_VERSION);
+            let key_fingerprint = room_key_fingerprint(&room_key);
 
             let mut rooms = state.rooms.lock().await;
             if rooms.rooms.contains_key(&room_id) {
@@ -926,11 +1616,13 @@ async fn handle_command(
             let session = RoomSession {
                 room_id: room_id.clone(),
                 room_key,
+                room_seed: Some(room_seed),
                 key_fingerprint: key_fingerprint.clone(),
                 ephemeral,
                 history_enabled: false,
                 members,
-                seen_message_ids: HashSet::new(),
+                membership: Some(membership),
+                replay_cache: ReplayCache::default(),
             };
 
             rooms.rooms.insert(room_id.clone(), session);
@@ -1077,33 +1769,47 @@ async fn handle_command(
         }
 
         UserCommand::Message { text } => {
-            send_room_message(&text, state).await?;
+            send_room_message(&text, store, state).await?;
         }
 
         UserCommand::History { enabled } => {
-            let mut rooms = state.rooms.lock().await;
-
-            let Some(active_room) = rooms.active_room.clone() else {
-                println!("error: no active room");
+            let Some(identity) = state.active_identity.as_ref() else {
+                println!("error: no active identity");
                 println!();
                 println!("hint:");
-                println!("  /join 123 --secret \"shared phrase\"");
+                println!("  /login <alias>");
                 return Ok(());
             };
 
-            let Some(room) = rooms.rooms.get_mut(&active_room) else {
-                anyhow::bail!("active room points to missing room state: {active_room}");
+            let (active_room, room_snapshot) = {
+                let mut rooms = state.rooms.lock().await;
+
+                let Some(active_room) = rooms.active_room.clone() else {
+                    println!("error: no active room");
+                    println!();
+                    println!("hint:");
+                    println!("  /join 123 --secret \"shared phrase\"");
+                    return Ok(());
+                };
+
+                let Some(room) = rooms.rooms.get_mut(&active_room) else {
+                    anyhow::bail!("active room points to missing room state: {active_room}");
+                };
+
+                if enabled && room.ephemeral {
+                    println!("error: cannot enable history for an ephemeral room");
+                    return Ok(());
+                }
+
+                room.history_enabled = enabled;
+                (active_room, room.clone())
             };
 
-            if enabled && room.ephemeral {
-                println!("error: cannot enable history for an ephemeral room");
-                return Ok(());
-            }
-
-            room.history_enabled = enabled;
             println!("room {active_room} history_enabled={enabled}");
             if enabled {
-                println!("note: durable encrypted history writer is deferred to v0.1.1");
+                let history_count = room_history_count(store, &room_snapshot, identity).await?;
+                println!("stored history entries: {history_count}");
+                print_room_history_preview(store, &room_snapshot, identity, 20).await?;
             }
         }
 
@@ -1141,7 +1847,7 @@ async fn handle_command(
 }
 
 /// Build, encrypt, sign and send a message to connected members of the active room.
-async fn send_room_message(text: &str, state: &mut AppState) -> Result<()> {
+async fn send_room_message(text: &str, store: &IdentityStore, state: &mut AppState) -> Result<()> {
     let Some(identity) = state.active_identity.as_ref() else {
         println!("error: no active identity");
         println!();
@@ -1195,10 +1901,26 @@ async fn send_room_message(text: &str, state: &mut AppState) -> Result<()> {
 
     enforce_message_policy(text, &mut state.message_policy)?;
 
-    let envelope = build_signed_envelope(identity, &room, text)?;
+    let (envelope, plain) = build_signed_envelope(identity, &room, text)?;
 
     for peer in &targets {
         p2p.send_envelope(*peer, envelope.clone()).await?;
+    }
+
+    if let Err(err) = record_room_history(
+        store,
+        &room,
+        &identity.alias,
+        RoomHistoryDirection::Outbound,
+        &plain.message_id,
+        &identity.peer_id,
+        &identity.alias,
+        &plain.body,
+        plain.timestamp_ms,
+    )
+    .await
+    {
+        println!("[history] warning: failed to persist outbound message: {err}");
     }
 
     println!(
@@ -1216,7 +1938,7 @@ fn build_signed_envelope(
     identity: &UnlockedIdentity,
     room: &RoomSession,
     body: &str,
-) -> Result<SignedEncryptedEnvelope> {
+) -> Result<(SignedEncryptedEnvelope, PlainMessage)> {
     let timestamp_ms = now_ms();
 
     let plain = PlainMessage {
@@ -1233,7 +1955,7 @@ fn build_signed_envelope(
     let signing_public_key = identity.signing_key.verifying_key().to_bytes();
 
     let mut envelope = SignedEncryptedEnvelope {
-        version: 1,
+        version: PROTOCOL_VERSION,
         room_id: room.room_id.clone(),
         sender_alias: identity.alias.clone(),
         sender_peer_id: identity.peer_id.clone(),
@@ -1250,7 +1972,7 @@ fn build_signed_envelope(
     let signature = sign_bytes(&identity.signing_key, &signing_payload);
     envelope.signature_b64 = BASE64.encode(signature);
 
-    Ok(envelope)
+    Ok((envelope, plain))
 }
 
 /// Build a signed online room invite for one connected peer.
@@ -1258,19 +1980,23 @@ fn build_signed_envelope(
 /// Phase 10 invites are not persisted and not offline-deliverable. They carry a
 /// random room key over the existing libp2p secure channel, signed by the
 /// sender's Ed25519 message identity.
-fn build_room_invite(
-    identity: &UnlockedIdentity,
-    room: &RoomSession,
-) -> Result<RoomInvite> {
+fn build_room_invite(identity: &UnlockedIdentity, room: &RoomSession) -> Result<RoomInvite> {
     let timestamp_ms = now_ms();
     let signing_public_key = identity.signing_key.verifying_key().to_bytes();
+    let Some(membership) = room.membership.clone() else {
+        anyhow::bail!("legacy /join rooms cannot be invited in Phase 12; create a hardened room with /create-room");
+    };
+    let Some(room_seed) = room.room_seed else {
+        anyhow::bail!("hardened room is missing its room seed");
+    };
 
     let mut invite = RoomInvite {
-        version: 1,
+        version: PROTOCOL_VERSION,
         invite_id: generate_message_id(),
         room_id: room.room_id.clone(),
-        room_key_b64: BASE64.encode(room.room_key),
+        room_key_b64: BASE64.encode(room_seed),
         ephemeral: room.ephemeral,
+        membership,
         sender_alias: identity.alias.clone(),
         sender_peer_id: identity.peer_id.clone(),
         sender_signing_public_key_b64: BASE64.encode(signing_public_key),
@@ -1285,6 +2011,152 @@ fn build_room_invite(
     invite.signature_b64 = BASE64.encode(signature);
 
     Ok(invite)
+}
+
+fn build_membership_state(
+    identity: &UnlockedIdentity,
+    room_id: &str,
+    peers: Vec<String>,
+) -> Result<RoomMembershipState> {
+    let signing_public_key = identity.signing_key.verifying_key().to_bytes();
+    let mut membership = RoomMembershipState {
+        version: PROTOCOL_VERSION,
+        room_id: room_id.to_string(),
+        creator_peer_id: identity.peer_id.clone(),
+        creator_signing_public_key_b64: BASE64.encode(signing_public_key),
+        peers: canonical_peer_list(peers),
+        membership_signature_b64: String::new(),
+    };
+
+    let payload = membership
+        .signing_payload()
+        .context("failed to build membership signing payload")?;
+    let signature = sign_bytes(&identity.signing_key, &payload);
+    membership.membership_signature_b64 = BASE64.encode(signature);
+
+    Ok(membership)
+}
+
+fn verify_membership_state(membership: &RoomMembershipState) -> Result<()> {
+    require_protocol_version(membership.version)?;
+
+    if membership.room_id.is_empty() || membership.room_id.len() > 64 {
+        anyhow::bail!("invalid membership room id");
+    }
+
+    if membership.peers.is_empty() {
+        anyhow::bail!("membership has no peers");
+    }
+
+    if membership.peers != canonical_peer_list(membership.peers.clone()) {
+        anyhow::bail!("membership peers must be sorted and deduplicated");
+    }
+
+    if !membership.peers.contains(&membership.creator_peer_id) {
+        anyhow::bail!("membership does not include creator peer");
+    }
+
+    let creator_public_key = BASE64
+        .decode(&membership.creator_signing_public_key_b64)
+        .context("invalid membership creator signing public key base64")?;
+    let signature = BASE64
+        .decode(&membership.membership_signature_b64)
+        .context("invalid membership signature base64")?;
+    let payload = membership
+        .signing_payload()
+        .context("failed to build membership signing payload")?;
+
+    verify_signature(&creator_public_key, &payload, &signature)
+        .context("invalid membership signature")?;
+
+    Ok(())
+}
+
+async fn record_room_history(
+    store: &IdentityStore,
+    room: &RoomSession,
+    identity_alias: &str,
+    direction: RoomHistoryDirection,
+    message_id: &str,
+    peer_id: &str,
+    alias: &str,
+    body: &str,
+    timestamp_ms: u64,
+) -> Result<()> {
+    if !room.history_enabled || room.ephemeral {
+        return Ok(());
+    }
+
+    let entry = RoomHistoryEntry {
+        version: PROTOCOL_VERSION,
+        room_id: room.room_id.clone(),
+        message_id: message_id.to_string(),
+        direction,
+        peer_id: peer_id.to_string(),
+        alias: alias.to_string(),
+        timestamp_ms,
+        body: body.to_string(),
+    };
+
+    store
+        .append_room_history(identity_alias, &room.room_id, &room.room_key, &entry)
+        .context("failed to append encrypted room history")?;
+
+    Ok(())
+}
+
+async fn load_room_history(
+    store: &IdentityStore,
+    room: &RoomSession,
+    identity: &UnlockedIdentity,
+) -> Result<Vec<RoomHistoryEntry>> {
+    store
+        .load_room_history(&identity.alias, &room.room_id, &room.room_key)
+        .context("failed to load encrypted room history")
+}
+
+fn format_history_direction(direction: RoomHistoryDirection) -> &'static str {
+    match direction {
+        RoomHistoryDirection::Inbound => "<-",
+        RoomHistoryDirection::Outbound => "->",
+    }
+}
+
+async fn print_room_history_preview(
+    store: &IdentityStore,
+    room: &RoomSession,
+    identity: &UnlockedIdentity,
+    limit: usize,
+) -> Result<()> {
+    let history = load_room_history(store, room, identity).await?;
+
+    if history.is_empty() {
+        println!("history: none");
+        return Ok(());
+    }
+
+    println!("history entries: {}", history.len());
+
+    for entry in history.iter().rev().take(limit).rev() {
+        println!(
+            "  [{}] {} {} [{}]: {}",
+            entry.room_id,
+            format_history_direction(entry.direction),
+            entry.alias,
+            entry.message_id,
+            entry.body
+        );
+    }
+
+    Ok(())
+}
+
+async fn room_history_count(
+    store: &IdentityStore,
+    room: &RoomSession,
+    identity: &UnlockedIdentity,
+) -> Result<usize> {
+    Ok(load_room_history(store, room, identity).await?.len())
 }
 
 /// Send an invite for the active room to a connected peer.
@@ -1336,7 +2208,35 @@ async fn send_room_invite(peer_id: &str, state: &mut AppState) -> Result<()> {
             anyhow::bail!("active room points to missing room state: {active_room}");
         };
 
+        if room.membership.is_some() && room.room_seed.is_some() {
+            if room
+                .membership
+                .as_ref()
+                .map(|membership| membership.creator_peer_id.as_str())
+                != Some(identity.peer_id.as_str())
+            {
+                anyhow::bail!("only the room creator can update signed membership in Phase 12");
+            }
+        }
+
         room.members.insert(peer);
+
+        if let Some(room_seed) = room.room_seed {
+            let membership = build_membership_state(
+                identity,
+                &room.room_id,
+                canonical_peer_list(room.members.iter().map(|peer| peer.to_string())),
+            )?;
+            room.room_key = derive_bound_room_key(
+                &room.room_id,
+                &membership.peers,
+                &room_seed,
+                PROTOCOL_VERSION,
+            );
+            room.key_fingerprint = room_key_fingerprint(&room.room_key);
+            room.membership = Some(membership);
+        }
+
         room.clone()
     };
 
@@ -1371,9 +2271,13 @@ async fn print_pending_invites(state: &AppState) -> Result<()> {
     for invite in pending {
         println!("  {}", invite.invite_id);
         println!("    room_id: {}", invite.room_id);
-        println!("    from: {} [{}]", invite.sender_alias, invite.sender_fingerprint);
+        println!(
+            "    from: {} [{}]",
+            invite.sender_alias, invite.sender_fingerprint
+        );
         println!("    peer_id: {}", invite.sender_peer_id);
         println!("    ephemeral: {}", invite.ephemeral);
+        println!("    received_at_ms: {}", invite.received_at_ms);
         println!("    room key fingerprint: {}", invite.key_fingerprint);
     }
 
@@ -1404,9 +2308,20 @@ async fn accept_invite(invite_id: &str, state: &mut AppState) -> Result<()> {
     };
 
     let self_peer = p2p.local_peer_id();
+    if !invite.membership.peers.contains(&self_peer.to_string()) {
+        anyhow::bail!(
+            "signed membership for room {} does not include this peer",
+            invite.room_id
+        );
+    }
+
     let mut members = HashSet::new();
-    members.insert(self_peer);
-    members.insert(invite.sender_peer_id);
+    for peer in &invite.membership.peers {
+        let parsed: PeerId = peer
+            .parse()
+            .with_context(|| format!("invalid peer id in membership: {peer}"))?;
+        members.insert(parsed);
+    }
 
     let mut rooms = state.rooms.lock().await;
 
@@ -1424,8 +2339,11 @@ async fn accept_invite(invite_id: &str, state: &mut AppState) -> Result<()> {
                 );
             }
 
-            existing.members.insert(self_peer);
-            existing.members.insert(invite.sender_peer_id);
+            existing.members = members.clone();
+            existing.room_key = invite.room_key;
+            existing.room_seed = Some(invite.room_seed);
+            existing.membership = Some(invite.membership.clone());
+            existing.key_fingerprint = invite.key_fingerprint.clone();
             existing.members.len()
         };
 
@@ -1433,7 +2351,10 @@ async fn accept_invite(invite_id: &str, state: &mut AppState) -> Result<()> {
 
         println!("accepted invite: {}", invite.invite_id);
         println!("active room: {}", invite.room_id);
-        println!("from: {} [{}]", invite.sender_alias, invite.sender_fingerprint);
+        println!(
+            "from: {} [{}]",
+            invite.sender_alias, invite.sender_fingerprint
+        );
         println!("members: {}", member_count);
         return Ok(());
     }
@@ -1441,11 +2362,13 @@ async fn accept_invite(invite_id: &str, state: &mut AppState) -> Result<()> {
     let session = RoomSession {
         room_id: invite.room_id.clone(),
         room_key: invite.room_key,
+        room_seed: Some(invite.room_seed),
         key_fingerprint: invite.key_fingerprint.clone(),
         ephemeral: invite.ephemeral,
         history_enabled: false,
         members,
-        seen_message_ids: HashSet::new(),
+        membership: Some(invite.membership.clone()),
+        replay_cache: ReplayCache::default(),
     };
 
     rooms.rooms.insert(invite.room_id.clone(), session);
@@ -1453,7 +2376,10 @@ async fn accept_invite(invite_id: &str, state: &mut AppState) -> Result<()> {
 
     println!("accepted invite: {}", invite.invite_id);
     println!("active room: {}", invite.room_id);
-    println!("from: {} [{}]", invite.sender_alias, invite.sender_fingerprint);
+    println!(
+        "from: {} [{}]",
+        invite.sender_alias, invite.sender_fingerprint
+    );
     println!("ephemeral: {}", invite.ephemeral);
     println!("history: false");
     println!("members: 2");
@@ -1490,6 +2416,9 @@ fn spawn_p2p_event_task(
     tokio::spawn(async move {
         while let Some(event) = p2p_events.recv().await {
             match event {
+                P2pEvent::Log { line } => {
+                    println!("{line}");
+                }
                 P2pEvent::PeerConnected { peer_id } => {
                     let _ = peer_id;
                 }
@@ -1528,6 +2457,8 @@ async fn handle_inbound_invite(
     trust: &SharedTrustBook,
     store: &IdentityStore,
 ) -> Result<()> {
+    require_protocol_version(invite.version)?;
+
     if invite.sender_peer_id != peer_id.to_string() {
         anyhow::bail!(
             "sender peer mismatch: connection peer is {}, invite claims {}",
@@ -1541,6 +2472,27 @@ async fn handle_inbound_invite(
     }
 
     validate_room_id(&invite.room_id)?;
+    verify_membership_state(&invite.membership)?;
+
+    if invite.membership.room_id != invite.room_id {
+        anyhow::bail!(
+            "invite room id '{}' does not match membership room id '{}'",
+            invite.room_id,
+            invite.membership.room_id
+        );
+    }
+
+    if !invite.membership.peers.contains(&peer_id.to_string()) {
+        anyhow::bail!("signed membership does not include invite sender");
+    }
+
+    if invite.sender_peer_id != invite.membership.creator_peer_id {
+        anyhow::bail!("Phase 12 invites must be sent by the signed room creator");
+    }
+
+    if invite.sender_signing_public_key_b64 != invite.membership.creator_signing_public_key_b64 {
+        anyhow::bail!("invite signing key does not match membership creator key");
+    }
 
     let signing_public_key = BASE64
         .decode(&invite.sender_signing_public_key_b64)
@@ -1555,16 +2507,25 @@ async fn handle_inbound_invite(
     verify_signature(&signing_public_key, &signing_payload, &signature)
         .context("invalid invite signature")?;
 
-    let room_key_bytes = BASE64
+    let room_seed_bytes = BASE64
         .decode(&invite.room_key_b64)
-        .context("invalid invite room key base64")?;
+        .context("invalid invite room seed base64")?;
 
-    if room_key_bytes.len() != 32 {
-        anyhow::bail!("invalid invite room key length: expected 32 bytes, got {}", room_key_bytes.len());
+    if room_seed_bytes.len() != 32 {
+        anyhow::bail!(
+            "invalid invite room seed length: expected 32 bytes, got {}",
+            room_seed_bytes.len()
+        );
     }
 
-    let mut room_key = [0u8; 32];
-    room_key.copy_from_slice(&room_key_bytes);
+    let mut room_seed = [0u8; 32];
+    room_seed.copy_from_slice(&room_seed_bytes);
+    let room_key = derive_bound_room_key(
+        &invite.room_id,
+        &invite.membership.peers,
+        &room_seed,
+        PROTOCOL_VERSION,
+    );
 
     let fingerprint = fingerprint_from_public_key(&signing_public_key);
     let trust_status =
@@ -1574,8 +2535,10 @@ async fn handle_inbound_invite(
         invite_id: invite.invite_id.clone(),
         room_id: invite.room_id.clone(),
         room_key,
+        room_seed,
         key_fingerprint: room_key_fingerprint(&room_key),
         ephemeral: invite.ephemeral,
+        membership: invite.membership.clone(),
         sender_alias: invite.sender_alias.clone(),
         sender_peer_id: peer_id,
         sender_fingerprint: fingerprint.clone(),
@@ -1584,7 +2547,9 @@ async fn handle_inbound_invite(
 
     {
         let mut invites = invites.lock().await;
-        invites.pending.insert(pending.invite_id.clone(), pending.clone());
+        invites
+            .pending
+            .insert(pending.invite_id.clone(), pending.clone());
     }
 
     println!();
@@ -1601,7 +2566,10 @@ async fn handle_inbound_invite(
                 "[invite] [untrusted] {} [{}] invites you to room {}",
                 invite.sender_alias, fingerprint, invite.room_id
             );
-            println!("hint: verify fingerprint out-of-band, then run /trust {}", peer_id);
+            println!(
+                "hint: verify fingerprint out-of-band, then run /trust {}",
+                peer_id
+            );
         }
         InboundTrustStatus::KeyChanged {
             old_fingerprint,
@@ -1635,7 +2603,9 @@ async fn handle_inbound_envelope(
     trust: &SharedTrustBook,
     store: &IdentityStore,
 ) -> Result<()> {
-    let room_key = {
+    require_protocol_version(envelope.version)?;
+
+    let (room_key, room_snapshot) = {
         let rooms = rooms.lock().await;
         let Some(room) = rooms.rooms.get(&envelope.room_id) else {
             anyhow::bail!(
@@ -1657,7 +2627,7 @@ async fn handle_inbound_envelope(
             );
         }
 
-        room.room_key
+        (room.room_key, room.clone())
     };
 
     if envelope.sender_peer_id != peer_id.to_string() {
@@ -1688,8 +2658,8 @@ async fn handle_inbound_envelope(
         .decode(&envelope.ciphertext_b64)
         .context("invalid ciphertext base64")?;
 
-    let plaintext =
-        decrypt_room_message(&room_key, &nonce, &ciphertext).context("message decryption failed")?;
+    let plaintext = decrypt_room_message(&room_key, &nonce, &ciphertext)
+        .context("message decryption failed")?;
     let plain: PlainMessage =
         serde_json::from_slice(&plaintext).context("failed to deserialize plaintext message")?;
 
@@ -1701,7 +2671,7 @@ async fn handle_inbound_envelope(
         );
     }
 
-    if plain.message_id.is_empty() || plain.message_id.len() > 64 {
+    if !is_valid_message_id(&plain.message_id) {
         anyhow::bail!("invalid message id in decrypted plaintext");
     }
 
@@ -1723,20 +2693,38 @@ async fn handle_inbound_envelope(
             );
         }
 
-        if !room.seen_message_ids.insert(replay_key) {
+        if !room.replay_cache.insert(replay_key) {
             anyhow::bail!(
                 "replayed message rejected from peer {} in room '{}'",
                 peer_id,
                 envelope.room_id
             );
         }
+    }
 
-        // Bound memory usage. This is intentionally simple for v0.1; if the
-        // cache grows too large during a long session, we clear it instead of
-        // keeping unbounded state. Durable replay protection belongs with the
-        // future encrypted history layer.
-        if room.seen_message_ids.len() > 4096 {
-            room.seen_message_ids.clear();
+    if room_snapshot.history_enabled {
+        let local_identity_alias = {
+            let trust = trust.lock().await;
+            trust.identity_alias.clone()
+        };
+
+        if let Some(local_identity_alias) = local_identity_alias {
+            let peer_id_string = peer_id.to_string();
+            if let Err(err) = record_room_history(
+                store,
+                &room_snapshot,
+                &local_identity_alias,
+                RoomHistoryDirection::Inbound,
+                &plain.message_id,
+                &peer_id_string,
+                &envelope.sender_alias,
+                &plain.body,
+                plain.timestamp_ms,
+            )
+            .await
+            {
+                println!("[history] warning: failed to persist inbound message: {err}");
+            }
         }
     }
 
@@ -1758,7 +2746,10 @@ async fn handle_inbound_envelope(
                 "[{}] [untrusted] {} [{}]: {}",
                 envelope.room_id, envelope.sender_alias, fingerprint, plain.body
             );
-            println!("hint: verify fingerprint out-of-band, then run /trust {}", peer_id);
+            println!(
+                "hint: verify fingerprint out-of-band, then run /trust {}",
+                peer_id
+            );
         }
         InboundTrustStatus::KeyChanged {
             old_fingerprint,
@@ -1777,14 +2768,14 @@ async fn handle_inbound_envelope(
     Ok(())
 }
 
-
-
 /// Enforce local message policy before encryption and network transmission.
 fn enforce_message_policy(text: &str, policy: &mut MessagePolicy) -> Result<()> {
     let char_count = text.chars().count();
 
     if char_count == 0 {
-        anyhow::bail!("message rejected by local policy\n\nreason:\n  empty messages are not allowed");
+        anyhow::bail!(
+            "message rejected by local policy\n\nreason:\n  empty messages are not allowed"
+        );
     }
 
     if char_count > policy.max_chars {
@@ -1870,7 +2861,21 @@ fn is_link_like_token(token: &str) -> bool {
     let trimmed = token.trim_matches(|ch: char| {
         matches!(
             ch,
-            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '!' | '?'
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
         )
     });
 
@@ -1881,10 +2886,7 @@ fn is_link_like_token(token: &str) -> bool {
         return false;
     }
 
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("www.")
-    {
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
         return true;
     }
 
@@ -1961,15 +2963,27 @@ fn print_message_policy(policy: &MessagePolicy) {
     println!("  max chars: {}", policy.max_chars);
     println!(
         "  links: {}",
-        if policy.reject_links { "rejected" } else { "allowed" }
+        if policy.reject_links {
+            "rejected"
+        } else {
+            "allowed"
+        }
     );
     println!(
         "  multiline: {}",
-        if policy.reject_multiline { "rejected" } else { "allowed" }
+        if policy.reject_multiline {
+            "rejected"
+        } else {
+            "allowed"
+        }
     );
     println!(
         "  control chars: {}",
-        if policy.reject_control_chars { "rejected" } else { "allowed" }
+        if policy.reject_control_chars {
+            "rejected"
+        } else {
+            "allowed"
+        }
     );
     println!(
         "  rate limit: {} messages / {}s",
@@ -1978,7 +2992,6 @@ fn print_message_policy(policy: &MessagePolicy) {
     );
     println!("  paste/file-transfer mode: unavailable");
 }
-
 
 /// Handle `/trust` commands.
 ///
@@ -2072,7 +3085,10 @@ async fn handle_trust_command(
             println!("  alias: {}", record.alias);
             println!("  peer_id: {}", record.peer_id);
             println!("  fingerprint: {}", record.fingerprint);
-            println!("  path: {}", store.trusted_peers_path(&identity.alias).display());
+            println!(
+                "  path: {}",
+                store.trusted_peers_path(&identity.alias).display()
+            );
         }
 
         TrustCommand::Remove { peer_id } => {
@@ -2148,7 +3164,6 @@ async fn observe_and_classify_peer(
     }
 }
 
-
 async fn observe_and_classify_invite_peer(
     peer_id: PeerId,
     invite: &RoomInvite,
@@ -2198,10 +3213,20 @@ async fn observe_and_classify_invite_peer(
     }
 }
 
-
 fn parse_startup_config() -> Result<StartupConfig> {
-    let mut args = std::env::args().skip(1);
+    parse_startup_config_from(std::env::args().skip(1))
+}
+
+fn parse_startup_config_from<I, S>(args: I) -> Result<StartupConfig>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into);
     let mut listen = DEFAULT_LISTEN_ADDR.to_string();
+    let mut bootstraps = Vec::new();
+    let mut external_addrs = Vec::new();
+    let mut relay_server = false;
     let mut tui = false;
 
     while let Some(arg) = args.next() {
@@ -2212,16 +3237,45 @@ fn parse_startup_config() -> Result<StartupConfig> {
                 };
                 listen = value;
             }
+            "--bootstrap" => {
+                let Some(value) = args.next() else {
+                    anyhow::bail!("--bootstrap requires a full multiaddr value");
+                };
+                let addr: Multiaddr = value
+                    .parse()
+                    .with_context(|| format!("invalid bootstrap multiaddr: {value}"))?;
+                if !addr
+                    .iter()
+                    .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
+                {
+                    anyhow::bail!("--bootstrap multiaddr must include /p2p/<peer_id>: {value}");
+                }
+                bootstraps.push(addr);
+            }
+            "--relay-server" => {
+                relay_server = true;
+            }
+            "--external-addr" => {
+                let Some(value) = args.next() else {
+                    anyhow::bail!("--external-addr requires a multiaddr value");
+                };
+                let addr: Multiaddr = value
+                    .parse()
+                    .with_context(|| format!("invalid external multiaddr: {value}"))?;
+                external_addrs.push(addr);
+            }
             "--tui" => {
                 tui = true;
             }
             "--help" | "-h" => {
                 println!("usage:");
-                println!("  dogel.bin [--listen <multiaddr>] [--tui]");
+                println!("  dogel.bin [--listen <multiaddr>] [--bootstrap <multiaddr>] [--relay-server] [--external-addr <multiaddr>] [--tui]");
                 println!();
                 println!("examples:");
                 println!("  dogel.bin --listen /ip4/0.0.0.0/tcp/7777");
                 println!("  dogel.bin --tui --listen /ip4/0.0.0.0/tcp/7778");
+                println!("  dogel.bin --relay-server --listen /ip4/0.0.0.0/tcp/7777 --external-addr /ip4/<public-ip>/tcp/7777");
+                println!("  dogel.bin --bootstrap /ip4/<relay-host>/tcp/7777/p2p/<relay-peer-id>");
                 std::process::exit(0);
             }
             other => {
@@ -2234,12 +3288,17 @@ fn parse_startup_config() -> Result<StartupConfig> {
         .parse()
         .with_context(|| format!("invalid listen multiaddr: {listen}"))?;
 
-    Ok(StartupConfig { listen_addr, tui })
+    Ok(StartupConfig {
+        listen_addr,
+        bootstrap_peers: bootstraps,
+        relay_server,
+        external_addrs,
+        tui,
+    })
 }
 
 fn prompt_new_password() -> Result<String> {
-    let password = rpassword::prompt_password("Password: ")
-        .context("failed to read password")?;
+    let password = rpassword::prompt_password("Password: ").context("failed to read password")?;
     let confirm = rpassword::prompt_password("Confirm password: ")
         .context("failed to read password confirmation")?;
 
@@ -2247,11 +3306,16 @@ fn prompt_new_password() -> Result<String> {
         anyhow::bail!("passwords do not match");
     }
 
+    validate_new_password(&password)?;
+
+    Ok(password)
+}
+
+fn validate_new_password(password: &str) -> Result<()> {
     if password.len() < 8 {
         anyhow::bail!("password must be at least 8 characters long");
     }
-
-    Ok(password)
+    Ok(())
 }
 
 /// Derive a deterministic one-to-one room id from two peer ids.
@@ -2297,12 +3361,14 @@ fn validate_room_id(room_id: &str) -> Result<()> {
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
     {
-        anyhow::bail!(
-            "room id may contain only ASCII letters, numbers, '-', '_' and '.'"
-        );
+        anyhow::bail!("room id may contain only ASCII letters, numbers, '-', '_' and '.'");
     }
 
     Ok(())
+}
+
+fn is_valid_message_id(message_id: &str) -> bool {
+    message_id.len() == 32 && message_id.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn sorted_peers(peers: &HashSet<PeerId>) -> Vec<PeerId> {
@@ -2375,21 +3441,32 @@ async fn print_status(state: &AppState, store: &IdentityStore) -> Result<()> {
 
     println!();
     println!("active room:");
-    let rooms = state.rooms.lock().await;
-    if let Some(active_room) = rooms.active_room.as_ref() {
-        if let Some(room) = rooms.rooms.get(active_room) {
-            println!("  room_id: {}", room.room_id);
-            println!("  ephemeral: {}", room.ephemeral);
-            println!("  history: {}", room.history_enabled);
-            println!("  members: {}", room.members.len());
-            println!("  key fingerprint: {}", room.key_fingerprint);
-        } else {
-            println!("  corrupted state: active room points to missing room '{active_room}'");
+    let active_room = {
+        let rooms = state.rooms.lock().await;
+        rooms
+            .active_room
+            .as_ref()
+            .and_then(|room_id| rooms.rooms.get(room_id))
+            .cloned()
+    };
+
+    if let Some(room) = active_room {
+        println!("  room_id: {}", room.room_id);
+        println!("  ephemeral: {}", room.ephemeral);
+        println!("  history: {}", room.history_enabled);
+        println!("  members: {}", room.members.len());
+        println!("  key fingerprint: {}", room.key_fingerprint);
+        if room.history_enabled {
+            if let Some(identity) = state.active_identity.as_ref() {
+                match room_history_count(store, &room, identity).await {
+                    Ok(count) => println!("  stored history entries: {}", count),
+                    Err(err) => println!("  stored history entries: unavailable ({err})"),
+                }
+            }
         }
     } else {
         println!("  none");
     }
-    drop(rooms);
 
     println!();
     println!("invites:");
@@ -2433,30 +3510,87 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
 
     lines.push("network:".to_string());
     if let Some(p2p) = state.p2p.as_ref() {
-        let peers = p2p.connected_peers().await?;
-        let addrs = p2p.listen_addrs().await?;
+        let diagnostics = p2p.diagnostics().await?;
         lines.push("  p2p: running".to_string());
         lines.push(format!("  local_peer_id: {}", p2p.local_peer_id()));
-        lines.push(format!("  connected peers: {}", peers.len()));
-        lines.push(format!("  confirmed listen addresses: {}", addrs.len()));
+        lines.push(format!(
+            "  connected peers: {}",
+            diagnostics.connected_peers.len()
+        ));
+        lines.push(format!(
+            "  confirmed listen addresses: {}",
+            diagnostics.listen_addrs.len()
+        ));
+        lines.push(format!("  relay server: {}", diagnostics.relay_server));
+        lines.push(format!(
+            "  bootstrap peers: {}",
+            diagnostics.bootstrap_peers.len()
+        ));
+        lines.push(format!(
+            "  relay reservations: {}",
+            diagnostics.relay_reservations.len()
+        ));
+        lines.push(format!(
+            "  relayed listen addresses: {}",
+            diagnostics.relayed_addrs.len()
+        ));
+        lines.push(format!(
+            "  external addresses: {}",
+            diagnostics.external_addrs.len()
+        ));
+        if !diagnostics.relay_reservation_errors.is_empty() {
+            lines.push("  relay reservation errors:".to_string());
+            for err in diagnostics.relay_reservation_errors {
+                lines.push(format!("    {err}"));
+            }
+        }
     } else {
         lines.push("  p2p: not-started".to_string());
+        lines.push(format!("  relay server: {}", state.relay_server));
+        lines.push(format!(
+            "  bootstrap peers: {}",
+            state.bootstrap_peers.len()
+        ));
+        lines.push(format!(
+            "  external addresses: {}",
+            state.external_addrs.len()
+        ));
     }
 
-    let rooms = state.rooms.lock().await;
+    let (room_count, active_room) = {
+        let rooms = state.rooms.lock().await;
+        (
+            rooms.rooms.len(),
+            rooms
+                .active_room
+                .as_ref()
+                .and_then(|room_id| rooms.rooms.get(room_id))
+                .cloned(),
+        )
+    };
+
     lines.push("rooms:".to_string());
-    lines.push(format!("  total: {}", rooms.rooms.len()));
-    match rooms.active_room.as_ref().and_then(|room_id| rooms.rooms.get(room_id)) {
+    lines.push(format!("  total: {}", room_count));
+    match active_room {
         Some(room) => {
             lines.push(format!("  active: {}", room.room_id));
             lines.push(format!("  ephemeral: {}", room.ephemeral));
             lines.push(format!("  history: {}", room.history_enabled));
             lines.push(format!("  members: {}", room.members.len()));
-            lines.push(format!("  replay cache: {}", room.seen_message_ids.len()));
+            lines.push(format!("  replay cache: {}", room.replay_cache.len()));
+            if room.history_enabled {
+                if let Some(identity) = state.active_identity.as_ref() {
+                    match room_history_count(store, &room, identity).await {
+                        Ok(count) => lines.push(format!("  stored history entries: {}", count)),
+                        Err(err) => {
+                            lines.push(format!("  stored history entries: unavailable ({err})"))
+                        }
+                    }
+                }
+            }
         }
         None => lines.push("  active: none".to_string()),
     }
-    drop(rooms);
 
     let invites = state.invites.lock().await;
     lines.push("invites:".to_string());
@@ -2471,8 +3605,14 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
     lines.push("policy:".to_string());
     lines.push(format!("  mode: {}", state.message_policy.mode_name()));
     lines.push(format!("  max chars: {}", state.message_policy.max_chars));
-    lines.push(format!("  links rejected: {}", state.message_policy.reject_links));
-    lines.push(format!("  multiline rejected: {}", state.message_policy.reject_multiline));
+    lines.push(format!(
+        "  links rejected: {}",
+        state.message_policy.reject_links
+    ));
+    lines.push(format!(
+        "  multiline rejected: {}",
+        state.message_policy.reject_multiline
+    ));
     lines.push(format!(
         "  rate limit: {} messages / {}s",
         state.message_policy.max_messages_per_window,
@@ -2480,7 +3620,10 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
     ));
 
     lines.push("runtime:".to_string());
-    lines.push(format!("  debug: {}", if state.debug_enabled { "on" } else { "off" }));
+    lines.push(format!(
+        "  debug: {}",
+        if state.debug_enabled { "on" } else { "off" }
+    ));
 
     Ok(lines)
 }
@@ -2558,12 +3701,14 @@ fn print_help() {
     println!("  /quit");
     println!();
     println!("startup:");
-    println!("  dogel.bin [--listen <multiaddr>] [--tui]");
+    println!("  dogel.bin [--listen <multiaddr>] [--bootstrap <multiaddr>] [--relay-server] [--external-addr <multiaddr>] [--tui]");
     println!();
     println!("generic examples:");
     println!("  /login <alias>");
     println!("  /whoami");
     println!("  /connect /ip4/<host>/tcp/<port>/p2p/<peer_id>");
+    println!("  dogel.bin --relay-server --listen /ip4/0.0.0.0/tcp/7777 --external-addr /ip4/<public-ip>/tcp/7777");
+    println!("  dogel.bin --bootstrap /ip4/<relay-host>/tcp/7777/p2p/<relay-peer-id>");
     println!("  /create-room --ephemeral");
     println!("  /invite <peer_id>");
     println!("  /invites");
@@ -2573,4 +3718,118 @@ fn print_help() {
     println!("dev shortcuts still available:");
     println!("  /join <room_id> --secret \"<shared phrase>\" --ephemeral");
     println!("  /dm <peer_id> --secret \"<shared phrase>\" --ephemeral");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_128_bit_hex_message_ids() {
+        assert!(is_valid_message_id("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(is_valid_message_id("0123456789abcdef0123456789abcdef"));
+        assert!(!is_valid_message_id(""));
+        assert!(!is_valid_message_id("0123456789ABCDEF"));
+        assert!(!is_valid_message_id("0123456789ABCDEF0123456789ABCDEG"));
+    }
+
+    #[test]
+    fn replay_cache_rejects_duplicates_and_evicts_oldest() {
+        let mut cache = ReplayCache {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: 2,
+        };
+
+        assert!(cache.insert("a".to_string()));
+        assert!(!cache.insert("a".to_string()));
+        assert!(cache.insert("b".to_string()));
+        assert!(cache.insert("c".to_string()));
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.insert("a".to_string()));
+    }
+
+    #[test]
+    fn parses_phase13_startup_network_flags() {
+        let relay_peer = PeerId::random();
+        let bootstrap = format!("/ip4/127.0.0.1/tcp/7777/p2p/{relay_peer}");
+
+        let config = parse_startup_config_from([
+            "--listen",
+            "/ip4/0.0.0.0/tcp/7778",
+            "--bootstrap",
+            bootstrap.as_str(),
+            "--relay-server",
+            "--external-addr",
+            "/ip4/203.0.113.10/tcp/7777",
+            "--tui",
+        ])
+        .expect("phase 13 startup flags should parse");
+
+        assert_eq!(config.listen_addr.to_string(), "/ip4/0.0.0.0/tcp/7778");
+        assert_eq!(config.bootstrap_peers.len(), 1);
+        assert_eq!(config.bootstrap_peers[0].to_string(), bootstrap);
+        assert!(config.relay_server);
+        assert_eq!(config.external_addrs.len(), 1);
+        assert!(config.tui);
+    }
+
+    #[test]
+    fn rejects_bootstrap_without_peer_id() {
+        let err =
+            parse_startup_config_from(["--bootstrap", "/ip4/127.0.0.1/tcp/7777"]).unwrap_err();
+        assert!(err.to_string().contains("must include /p2p/<peer_id>"));
+    }
+
+    #[test]
+    fn tui_create_identity_secret_flow_reaches_confirmation() {
+        let mut tui = TuiState::new();
+        tui.start_secret_flow(TuiSecretFlow::CreateIdentity {
+            alias: "alice".to_string(),
+            first_password: None,
+        });
+
+        assert_eq!(tui.secret_prompt(), Some("Password: "));
+        tui.input = "supersecret".to_string();
+        tui.input_cursor = tui.input.len();
+        let password = tui.take_input(false);
+        tui.secret_flow = Some(TuiSecretFlow::CreateIdentity {
+            alias: "alice".to_string(),
+            first_password: Some(password),
+        });
+
+        assert_eq!(tui.secret_prompt(), Some("Confirm password: "));
+        assert!(tui.input.is_empty());
+        assert!(tui.input_history.is_empty());
+    }
+
+    #[test]
+    fn tui_login_secret_flow_clears_secret_without_history() {
+        let mut tui = TuiState::new();
+        tui.start_secret_flow(TuiSecretFlow::Login {
+            alias: "alice".to_string(),
+        });
+
+        assert_eq!(tui.secret_prompt(), Some("Password: "));
+        tui.input = "supersecret".to_string();
+        tui.input_cursor = tui.input.len();
+        assert_eq!(tui.take_input(false), "supersecret");
+        assert!(tui.input.is_empty());
+        assert!(tui.input_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn captures_command_output_lines() {
+        let (value, lines) = capture_command_output(async {
+            println!("one");
+            println!();
+            println!("two");
+            7
+        })
+        .await;
+
+        assert_eq!(value, 7);
+        assert_eq!(lines, vec!["one", "", "two"]);
+    }
 }

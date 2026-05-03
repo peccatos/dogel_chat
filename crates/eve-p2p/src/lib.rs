@@ -12,11 +12,10 @@
 use eve_protocol::{DogelRequest, DogelResponse, RoomInvite, SignedEncryptedEnvelope};
 use futures::StreamExt;
 use libp2p::{
-    core::{transport::Boxed, upgrade},
-    identify, noise, ping, request_response,
+    identify, noise, ping, relay, request_response,
     request_response::{json, Message as RequestResponseMessage, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, Transport,
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use libp2p_identity::Keypair;
 use std::collections::{HashMap, HashSet};
@@ -52,14 +51,54 @@ pub enum P2pError {
     MissingPeerId(String),
 }
 
+/// Phase 13 network configuration.
+#[derive(Debug, Clone)]
+pub struct P2pConfig {
+    pub listen_addr: Multiaddr,
+    pub bootstrap_peers: Vec<Multiaddr>,
+    pub relay_server: bool,
+    pub external_addrs: Vec<Multiaddr>,
+}
+
+impl P2pConfig {
+    pub fn lan_only(listen_addr: Multiaddr) -> Self {
+        Self {
+            listen_addr,
+            bootstrap_peers: Vec::new(),
+            relay_server: false,
+            external_addrs: Vec::new(),
+        }
+    }
+}
+
+/// Snapshot returned to the CLI for `/doctor` and `/whoami` style diagnostics.
+#[derive(Debug, Clone)]
+pub struct P2pDiagnostics {
+    pub connected_peers: Vec<PeerId>,
+    pub listen_addrs: Vec<Multiaddr>,
+    pub bootstrap_peers: Vec<Multiaddr>,
+    pub relay_server: bool,
+    pub relay_reservations: Vec<PeerId>,
+    pub relay_reservation_errors: Vec<String>,
+    pub external_addrs: Vec<Multiaddr>,
+    pub relayed_addrs: Vec<Multiaddr>,
+}
+
 /// Events emitted by the P2P runtime to the CLI/application layer.
 ///
 /// The CLI owns room keys and identity metadata, so inbound encrypted envelopes
 /// are forwarded upward instead of decrypted here.
 #[derive(Debug, Clone)]
 pub enum P2pEvent {
-    PeerConnected { peer_id: PeerId },
-    PeerDisconnected { peer_id: PeerId },
+    Log {
+        line: String,
+    },
+    PeerConnected {
+        peer_id: PeerId,
+    },
+    PeerDisconnected {
+        peer_id: PeerId,
+    },
     InboundEnvelope {
         peer_id: PeerId,
         envelope: SignedEncryptedEnvelope,
@@ -84,25 +123,10 @@ impl P2pHandle {
     /// what makes the displayed `peer_id` stable across restarts.
     pub async fn start(
         network_keypair: Keypair,
-        listen_addr: Multiaddr,
+        config: P2pConfig,
     ) -> Result<(Self, mpsc::Receiver<P2pEvent>), P2pError> {
         let local_peer_id = PeerId::from(network_keypair.public());
-        let transport = build_transport(&network_keypair)?;
-
-        let behaviour = DogelBehaviour {
-            ping: ping::Behaviour::new(ping::Config::new()),
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/dogel/0.1".to_string(),
-                network_keypair.public(),
-            )),
-            messaging: json::Behaviour::<DogelRequest, DogelResponse>::new(
-                [(
-                    StreamProtocol::new("/dogel/message/1"),
-                    ProtocolSupport::Full,
-                )],
-                request_response::Config::default(),
-            ),
-        };
+        let public_key = network_keypair.public();
 
         let swarm_config = libp2p::swarm::Config::with_tokio_executor()
             // Keep LAN test connections around even when idle. Once the custom
@@ -110,18 +134,52 @@ impl P2pHandle {
             // but the long timeout still makes manual CLI debugging friendlier.
             .with_idle_connection_timeout(Duration::from_secs(24 * 60 * 60));
 
-        let mut swarm = Swarm::new(transport, behaviour, local_peer_id, swarm_config);
+        let mut swarm = SwarmBuilder::with_existing_identity(network_keypair)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .map_err(|err| P2pError::Noise(err.to_string()))?
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|err| P2pError::Noise(err.to_string()))?
+            .with_behaviour(|_, relay_client| DogelBehaviour {
+                ping: ping::Behaviour::new(ping::Config::new()),
+                identify: identify::Behaviour::new(identify::Config::new(
+                    "/dogel/0.1".to_string(),
+                    public_key,
+                )),
+                messaging: json::Behaviour::<DogelRequest, DogelResponse>::new(
+                    [(
+                        StreamProtocol::new("/dogel/message/1"),
+                        ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+                relay_client,
+                relay_server: relay::Behaviour::new(local_peer_id, relay::Config::default()),
+            })
+            .expect("dogel behaviour construction is infallible")
+            .with_swarm_config(|_| swarm_config)
+            .build();
 
-        Swarm::listen_on(&mut swarm, listen_addr.clone()).map_err(|source| P2pError::Listen {
-            addr: listen_addr,
-            source,
+        Swarm::listen_on(&mut swarm, config.listen_addr.clone()).map_err(|source| {
+            P2pError::Listen {
+                addr: config.listen_addr.clone(),
+                source,
+            }
         })?;
+
+        for addr in &config.external_addrs {
+            Swarm::add_external_address(&mut swarm, addr.clone());
+        }
 
         let (command_tx, command_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
 
         tokio::spawn(async move {
-            run_swarm(swarm, command_rx, event_tx).await;
+            run_swarm(swarm, config, command_rx, event_tx).await;
         });
 
         Ok((
@@ -185,11 +243,7 @@ impl P2pHandle {
     ///
     /// The invite is signed by the application layer. In Phase 10 its room key is
     /// confidential because it travels over the direct libp2p Noise channel.
-    pub async fn send_invite(
-        &self,
-        peer_id: PeerId,
-        invite: RoomInvite,
-    ) -> Result<(), P2pError> {
+    pub async fn send_invite(&self, peer_id: PeerId, invite: RoomInvite) -> Result<(), P2pError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(P2pCommand::SendInvite {
@@ -224,6 +278,17 @@ impl P2pHandle {
 
         rx.await.map_err(|_| P2pError::ResponseDropped)
     }
+
+    /// Snapshot of Phase 13 networking state.
+    pub async fn diagnostics(&self) -> Result<P2pDiagnostics, P2pError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(P2pCommand::Diagnostics { reply: tx })
+            .await
+            .map_err(|_| P2pError::RuntimeClosed)?;
+
+        rx.await.map_err(|_| P2pError::ResponseDropped)
+    }
 }
 
 enum P2pCommand {
@@ -248,6 +313,9 @@ enum P2pCommand {
     ListenAddrs {
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
+    Diagnostics {
+        reply: oneshot::Sender<P2pDiagnostics>,
+    },
 }
 
 #[derive(NetworkBehaviour)]
@@ -256,6 +324,8 @@ struct DogelBehaviour {
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     messaging: json::Behaviour<DogelRequest, DogelResponse>,
+    relay_client: relay::client::Behaviour,
+    relay_server: relay::Behaviour,
 }
 
 /// Event enum generated target for the `NetworkBehaviour` derive.
@@ -264,6 +334,8 @@ enum DogelBehaviourEvent {
     Ping(ping::Event),
     Identify(identify::Event),
     Messaging(request_response::Event<DogelRequest, DogelResponse>),
+    RelayClient(relay::client::Event),
+    RelayServer(relay::Event),
 }
 
 impl From<ping::Event> for DogelBehaviourEvent {
@@ -284,25 +356,76 @@ impl From<request_response::Event<DogelRequest, DogelResponse>> for DogelBehavio
     }
 }
 
-fn build_transport(
-    keypair: &Keypair,
-) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, P2pError> {
-    let tcp = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-    let noise = noise::Config::new(keypair).map_err(|err| P2pError::Noise(err.to_string()))?;
+impl From<relay::client::Event> for DogelBehaviourEvent {
+    fn from(event: relay::client::Event) -> Self {
+        Self::RelayClient(event)
+    }
+}
 
-    Ok(tcp
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise)
-        .multiplex(yamux::Config::default())
-        .boxed())
+impl From<relay::Event> for DogelBehaviourEvent {
+    fn from(event: relay::Event) -> Self {
+        Self::RelayServer(event)
+    }
 }
 
 async fn run_swarm(
     mut swarm: Swarm<DogelBehaviour>,
+    config: P2pConfig,
     mut command_rx: mpsc::Receiver<P2pCommand>,
     event_tx: mpsc::Sender<P2pEvent>,
 ) {
     let mut connected: HashSet<PeerId> = HashSet::new();
+    let mut relay_reservations: HashSet<PeerId> = HashSet::new();
+    let mut relay_reservation_errors: Vec<String> = Vec::new();
+
+    for bootstrap in &config.bootstrap_peers {
+        let Some(peer_id) = peer_id_from_multiaddr(bootstrap) else {
+            emit_log(
+                &event_tx,
+                format!("[p2p] bootstrap skipped; missing /p2p/<peer_id>: {bootstrap}"),
+            )
+            .await;
+            continue;
+        };
+
+        match Swarm::dial(&mut swarm, bootstrap.clone()) {
+            Ok(()) => {
+                emit_log(
+                    &event_tx,
+                    format!("[p2p] bootstrap dial started: {bootstrap}"),
+                )
+                .await;
+                if !config.relay_server {
+                    let relay_addr = bootstrap
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    match Swarm::listen_on(&mut swarm, relay_addr.clone()) {
+                        Ok(_) => {
+                            emit_log(
+                                &event_tx,
+                                format!("[p2p] relay reservation requested: {relay_addr}"),
+                            )
+                            .await
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "relay reservation listen failed for {peer_id} via {relay_addr}: {err}"
+                            );
+                            emit_log(&event_tx, format!("[p2p] {message}")).await;
+                            relay_reservation_errors.push(message);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                emit_log(
+                    &event_tx,
+                    format!("[p2p] bootstrap dial failed: {bootstrap}: {err}"),
+                )
+                .await;
+            }
+        }
+    }
 
     // libp2p's SwarmEvent API differs a bit across minor versions. Some
     // versions expose `remaining_established` in ConnectionClosed, others do
@@ -358,6 +481,31 @@ async fn run_swarm(
                         let addrs: Vec<_> = Swarm::listeners(&swarm).cloned().collect();
                         let _ = reply.send(addrs);
                     }
+                    P2pCommand::Diagnostics { reply } => {
+                        let mut peers: Vec<_> = connected.iter().copied().collect();
+                        peers.sort_by_key(|peer| peer.to_string());
+
+                        let mut reservations: Vec<_> =
+                            relay_reservations.iter().copied().collect();
+                        reservations.sort_by_key(|peer| peer.to_string());
+
+                        let listen_addrs: Vec<_> = Swarm::listeners(&swarm).cloned().collect();
+                        let external_addrs: Vec<_> =
+                            Swarm::external_addresses(&swarm).cloned().collect();
+                        let relayed_addrs =
+                            build_relayed_addrs(&config.bootstrap_peers, &reservations, *swarm.local_peer_id());
+
+                        let _ = reply.send(P2pDiagnostics {
+                            connected_peers: peers,
+                            listen_addrs,
+                            bootstrap_peers: config.bootstrap_peers.clone(),
+                            relay_server: config.relay_server,
+                            relay_reservations: reservations,
+                            relay_reservation_errors: relay_reservation_errors.clone(),
+                            external_addrs,
+                            relayed_addrs,
+                        });
+                    }
                 }
             }
 
@@ -365,8 +513,16 @@ async fn run_swarm(
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         let full = address.clone().with(libp2p::multiaddr::Protocol::P2p(*swarm.local_peer_id()));
-                        println!();
-                        println!("[p2p] listening on {full}");
+                        emit_log(&event_tx, format!("[p2p] listening on {full}")).await;
+                    }
+                    SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+                        if let Err(err) = reason {
+                            let message = format!(
+                                "listener closed with error: addresses={addresses:?} error={err}"
+                            );
+                            emit_log(&event_tx, format!("[p2p] {message}")).await;
+                            relay_reservation_errors.push(message);
+                        }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         let count = connection_counts.entry(peer_id).or_insert(0);
@@ -374,16 +530,19 @@ async fn run_swarm(
 
                         let was_new_peer = connected.insert(peer_id);
 
-                        println!();
                         if was_new_peer {
-                            println!("[p2p] connected: {peer_id}");
+                            emit_log(&event_tx, format!("[p2p] connected: {peer_id}")).await;
                             let _ = event_tx
                                 .send(P2pEvent::PeerConnected { peer_id })
                                 .await;
                         } else {
-                            println!("[p2p] additional connection established: {peer_id}");
+                            emit_log(
+                                &event_tx,
+                                format!("[p2p] additional connection established: {peer_id}"),
+                            )
+                            .await;
                         }
-                        println!("[p2p] endpoint: {endpoint:?}");
+                        emit_log(&event_tx, format!("[p2p] endpoint: {endpoint:?}")).await;
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         if let Some(count) = connection_counts.get_mut(&peer_id) {
@@ -393,8 +552,7 @@ async fn run_swarm(
                                 connection_counts.remove(&peer_id);
                                 connected.remove(&peer_id);
 
-                                println!();
-                                println!("[p2p] disconnected: {peer_id}");
+                                emit_log(&event_tx, format!("[p2p] disconnected: {peer_id}")).await;
                                 let _ = event_tx
                                     .send(P2pEvent::PeerDisconnected { peer_id })
                                     .await;
@@ -405,20 +563,21 @@ async fn run_swarm(
                             // connected set anyway. This keeps `/peers` honest.
                             connected.remove(&peer_id);
 
-                            println!();
-                            println!("[p2p] disconnected: {peer_id}");
+                            emit_log(&event_tx, format!("[p2p] disconnected: {peer_id}")).await;
                             let _ = event_tx
                                 .send(P2pEvent::PeerDisconnected { peer_id })
                                 .await;
                         }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                        println!();
-                        println!("[p2p] outgoing connection error: peer={peer_id:?} error={error}");
+                        emit_log(
+                            &event_tx,
+                            format!("[p2p] outgoing connection error: peer={peer_id:?} error={error}"),
+                        )
+                        .await;
                     }
                     SwarmEvent::IncomingConnectionError { error, .. } => {
-                        println!();
-                        println!("[p2p] incoming connection error: {error}");
+                        emit_log(&event_tx, format!("[p2p] incoming connection error: {error}")).await;
                     }
                     SwarmEvent::Behaviour(DogelBehaviourEvent::Messaging(event)) => {
                         handle_messaging_event(event, &event_tx, swarm.behaviour_mut()).await;
@@ -428,13 +587,85 @@ async fn run_swarm(
                         let _ = event;
                     }
                     SwarmEvent::Behaviour(DogelBehaviourEvent::Identify(event)) => {
-                        let _ = event;
+                        handle_identify_event(event, &mut swarm, config.relay_server);
+                    }
+                    SwarmEvent::Behaviour(DogelBehaviourEvent::RelayClient(event)) => {
+                        handle_relay_client_event(
+                            event,
+                            &mut relay_reservations,
+                            &event_tx,
+                        ).await;
+                    }
+                    SwarmEvent::Behaviour(DogelBehaviourEvent::RelayServer(event)) => {
+                        if config.relay_server {
+                            emit_log(&event_tx, format!("[p2p] relay server event: {event:?}")).await;
+                        }
                     }
                     _ => {}
                 }
             }
         }
     }
+}
+
+async fn emit_log(event_tx: &mpsc::Sender<P2pEvent>, line: String) {
+    let _ = event_tx.send(P2pEvent::Log { line }).await;
+}
+
+fn handle_identify_event(
+    event: identify::Event,
+    swarm: &mut Swarm<DogelBehaviour>,
+    relay_server: bool,
+) {
+    if !relay_server {
+        return;
+    }
+
+    if let identify::Event::Received { info, .. } = event {
+        Swarm::add_external_address(swarm, info.observed_addr);
+    }
+}
+
+async fn handle_relay_client_event(
+    event: relay::client::Event,
+    relay_reservations: &mut HashSet<PeerId>,
+    event_tx: &mpsc::Sender<P2pEvent>,
+) {
+    match event {
+        relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
+            relay_reservations.insert(relay_peer_id);
+            emit_log(
+                event_tx,
+                format!("[p2p] relay reservation accepted: {relay_peer_id}"),
+            )
+            .await;
+        }
+        other => {
+            emit_log(event_tx, format!("[p2p] relay client event: {other:?}")).await;
+        }
+    }
+}
+
+fn build_relayed_addrs(
+    bootstrap_peers: &[Multiaddr],
+    reservations: &[PeerId],
+    local_peer_id: PeerId,
+) -> Vec<Multiaddr> {
+    bootstrap_peers
+        .iter()
+        .filter_map(|addr| {
+            let relay_peer_id = peer_id_from_multiaddr(addr)?;
+            if !reservations.contains(&relay_peer_id) {
+                return None;
+            }
+
+            Some(
+                addr.clone()
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                    .with(libp2p::multiaddr::Protocol::P2p(local_peer_id)),
+            )
+        })
+        .collect()
 }
 
 async fn handle_messaging_event(
@@ -445,7 +676,9 @@ async fn handle_messaging_event(
     match event {
         request_response::Event::Message { peer, message, .. } => {
             match message {
-                RequestResponseMessage::Request { request, channel, .. } => {
+                RequestResponseMessage::Request {
+                    request, channel, ..
+                } => {
                     // Acknowledge transport-level receipt first. Actual message
                     // verification/decryption happens in the CLI event task.
                     let _ = behaviour
@@ -473,22 +706,33 @@ async fn handle_messaging_event(
                 }
                 RequestResponseMessage::Response { response, .. } => {
                     if !response.ok {
-                        println!();
-                        println!(
-                            "[p2p] remote rejected message: {}",
-                            response.error.unwrap_or_else(|| "unknown error".to_string())
-                        );
+                        emit_log(
+                            event_tx,
+                            format!(
+                                "[p2p] remote rejected message: {}",
+                                response
+                                    .error
+                                    .unwrap_or_else(|| "unknown error".to_string())
+                            ),
+                        )
+                        .await;
                     }
                 }
             }
         }
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            println!();
-            println!("[p2p] outbound message failure: peer={peer} error={error}");
+            emit_log(
+                event_tx,
+                format!("[p2p] outbound message failure: peer={peer} error={error}"),
+            )
+            .await;
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            println!();
-            println!("[p2p] inbound message failure: peer={peer} error={error}");
+            emit_log(
+                event_tx,
+                format!("[p2p] inbound message failure: peer={peer} error={error}"),
+            )
+            .await;
         }
         request_response::Event::ResponseSent { peer, .. } => {
             let _ = peer;

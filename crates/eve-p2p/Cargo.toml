@@ -13,6 +13,7 @@ libp2p = { version = "0.54", features = [
     "yamux",
     "ping",
     "identify",
+    "relay",
     "request-response",
     "json",
     "macros",

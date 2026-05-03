@@ -1,6 +1,6 @@
-# dogel.bin v0.1 phase 11
+# dogel.bin v0.1 phase 15
 
-Phase 11 keeps the working encrypted P2P messaging core, trust layer, strict message policy, crypto-hardening and online invites, then adds a minimal TUI mode plus stabilization commands.
+Phase 15 keeps the encrypted P2P messaging core, trust layer, strict message policy, online invites, Phase 12 protocol hardening, Phase 13 relay/bootstrap readiness and the Phase 14 ratatui layout, then routes command output natively into the TUI.
 
 ## Startup
 
@@ -10,7 +10,7 @@ Classic shell mode:
 cargo run -p dogel-cli -- --listen /ip4/0.0.0.0/tcp/7777
 ```
 
-Minimal TUI mode:
+TUI mode:
 
 ```bash
 cargo run -p dogel-cli -- --tui --listen /ip4/0.0.0.0/tcp/7777
@@ -23,14 +23,37 @@ make build
 ./target/debug/dogel.bin --tui --listen /ip4/0.0.0.0/tcp/7777
 ```
 
+Public relay/bootstrap node:
+
+```bash
+cargo run -p dogel-cli -- \
+  --relay-server \
+  --listen /ip4/0.0.0.0/tcp/7777 \
+  --external-addr /ip4/<public-ip>/tcp/7777
+```
+
+External clients using that relay:
+
+```bash
+cargo run -p dogel-cli -- \
+  --bootstrap /ip4/<relay-host>/tcp/7777/p2p/<relay-peer-id>
+```
+
+Run `/login <alias>`, then `/whoami` on each client. When the relay reservation is accepted, `/whoami` prints a `relayed listen` address that can be shared with the other client and used with `/connect`.
+
 ## TUI scope
 
-The TUI is intentionally minimal:
+The TUI is now the richer interactive terminal frontend:
 
 - alternate-screen terminal interface;
-- header with identity, room, peer count, trust count, policy and debug status;
-- session log panel;
-- single-line input panel;
+- header with identity, active room and policy;
+- session log with `PgUp`/`PgDn` scrollback;
+- status sidebar for network, relay, rooms, invites, trust and debug state;
+- single-line input panel with cursor movement, `Home`/`End`, `Delete`, `Backspace`;
+- input history with `Up`/`Down`;
+- native password prompts for `/identity create` and `/login`;
+- command output routed into the session log instead of shell fallback;
+- background P2P diagnostics routed into the TUI log;
 - same command parser as shell mode;
 - ordinary text without `/` still sends to active room;
 - strict message policy remains active;
@@ -38,7 +61,7 @@ The TUI is intentionally minimal:
 - no multiline input;
 - no file transfer.
 
-The shell mode remains the most stable debugging interface.
+The shell mode remains available for line-oriented debugging, but TUI mode no longer leaves alternate-screen for normal commands.
 
 ## New commands
 
@@ -50,7 +73,19 @@ The shell mode remains the most stable debugging interface.
 
 `/doctor` prints a health report for identity, P2P, rooms, invites, trust and policy.
 
-`/debug on|off` toggles runtime debug state. Phase 11 stores the flag and surfaces it in `/doctor`/TUI. Deeper debug routing can be attached later.
+`/debug on|off` toggles runtime debug state and surfaces it in `/doctor`/TUI.
+
+## Phase 13 networking
+
+New startup flags:
+
+```text
+--bootstrap <multiaddr>     Dial a known dogel peer at startup. Repeatable.
+--relay-server              Enable circuit relay service for other peers.
+--external-addr <multiaddr> Announce a public relay address manually. Repeatable.
+```
+
+The existing LAN/direct `/connect <multiaddr>` flow is unchanged. Bootstrap clients also request a circuit relay reservation by listening on the bootstrap peer's `/p2p-circuit` address.
 
 ## Existing invite flow
 
@@ -78,14 +113,16 @@ hello
 - Private keys are encrypted locally using password-derived keys.
 - Messages are encrypted with room keys and signed.
 - Room passphrase derivation uses Argon2id in the dev shortcut paths.
-- Online invites use the already-secured libp2p Noise channel and signed invite payloads.
+- Online invites use the already-secured libp2p Noise channel, signed invite payloads, and creator-signed membership state.
+- Invite-created room keys are derived from the room seed plus signed peer list, room id and protocol version.
+- Relay/bootstrap only changes transport reachability. The relay forwards encrypted libp2p traffic and does not receive dogel plaintext.
+- When room history is enabled, messages are written to an encrypted local history file and can be replayed from the stored history.
 - Strict policy rejects links, multiline input, control characters and bursts before encryption.
 - TUI mode does not weaken policy; it keeps single-line input only.
 
 ## Known limitations
 
-- TUI is minimal and not yet a full ratatui application architecture.
-- Some low-level background diagnostics may still be printed by runtime tasks.
+- Some lower-level runtime diagnostics may still be terse until the event model is expanded.
 - Online invites are not offline X25519 sealed invites yet.
-- No local encrypted history writer yet.
-- No relay/bootstrap/NAT traversal yet.
+- Legacy `/join --secret` rooms remain a dev shortcut and do not use signed membership.
+- Relay/bootstrap is early Phase 13 readiness. AutoNAT/DCUtR hole punching and production relay operations are not complete yet.

@@ -8,8 +8,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use directories::BaseDirs;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use eve_crypto::{
-    decrypt_private_key, encrypt_private_key, fingerprint_from_public_key,
-    EncryptedPrivateKeyFile,
+    decrypt_private_key, decrypt_room_message, encrypt_private_key, encrypt_room_message,
+    fingerprint_from_public_key, EncryptedPrivateKeyFile,
 };
 use libp2p_identity::{Keypair as NetworkKeypair, PeerId};
 use rand_core::{OsRng, RngCore};
@@ -31,6 +31,9 @@ pub enum StorageError {
 
     #[error("invalid alias: {0}")]
     InvalidAlias(String),
+
+    #[error("invalid room id: {0}")]
+    InvalidRoomId(String),
 
     #[error("identity already exists: {0}")]
     IdentityAlreadyExists(String),
@@ -114,6 +117,34 @@ pub struct TrustedPeersFile {
     pub peers: Vec<TrustedPeerRecord>,
 }
 
+/// Direction of a room history entry from the local client's perspective.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RoomHistoryDirection {
+    Inbound,
+    Outbound,
+}
+
+/// Plaintext room history entry before local encryption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomHistoryEntry {
+    pub version: u32,
+    pub room_id: String,
+    pub message_id: String,
+    pub direction: RoomHistoryDirection,
+    pub peer_id: String,
+    pub alias: String,
+    pub timestamp_ms: u64,
+    pub body: String,
+}
+
+/// Encrypted JSONL envelope stored per room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptedRoomHistoryEntry {
+    version: u32,
+    nonce_b64: String,
+    ciphertext_b64: String,
+}
+
 /// Summary returned after identity creation.
 #[derive(Debug, Clone)]
 pub struct CreatedIdentity {
@@ -133,6 +164,18 @@ pub struct UnlockedIdentity {
     pub fingerprint: String,
     pub network_keypair: NetworkKeypair,
     pub signing_key: SigningKey,
+}
+
+impl std::fmt::Debug for UnlockedIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnlockedIdentity")
+            .field("alias", &self.alias)
+            .field("peer_id", &self.peer_id)
+            .field("fingerprint", &self.fingerprint)
+            .field("network_keypair", &"<redacted>")
+            .field("signing_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Root storage handle.
@@ -253,8 +296,9 @@ impl IdentityStore {
         let network_private_bytes = decrypt_private_key(&encrypted_network, password)?;
         let signing_seed = decrypt_private_key(&encrypted_signing, password)?;
 
-        let network_keypair = NetworkKeypair::from_protobuf_encoding(network_private_bytes.as_ref())
-            .map_err(|err| StorageError::NetworkKeyDecoding(err.to_string()))?;
+        let network_keypair =
+            NetworkKeypair::from_protobuf_encoding(network_private_bytes.as_ref())
+                .map_err(|err| StorageError::NetworkKeyDecoding(err.to_string()))?;
 
         let derived_peer_id = PeerId::from(network_keypair.public()).to_string();
         if derived_peer_id != profile.network.peer_id {
@@ -291,10 +335,7 @@ impl IdentityStore {
     ///
     /// Missing `trusted_peers.toml` means the identity simply has not trusted
     /// anyone yet. That is not an error.
-    pub fn load_trusted_peers(
-        &self,
-        alias: &str,
-    ) -> Result<Vec<TrustedPeerRecord>, StorageError> {
+    pub fn load_trusted_peers(&self, alias: &str) -> Result<Vec<TrustedPeerRecord>, StorageError> {
         validate_alias(alias)?;
 
         let identity_dir = self.identity_dir(alias);
@@ -316,11 +357,7 @@ impl IdentityStore {
     /// Replacement is explicit: running `/trust <peer_id>` again after observing
     /// a different signing key updates the pin. The CLI prints warnings before
     /// calling this method, so storage remains a dumb persistence layer.
-    pub fn trust_peer(
-        &self,
-        alias: &str,
-        record: TrustedPeerRecord,
-    ) -> Result<(), StorageError> {
+    pub fn trust_peer(&self, alias: &str, record: TrustedPeerRecord) -> Result<(), StorageError> {
         validate_alias(alias)?;
 
         let identity_dir = self.identity_dir(alias);
@@ -333,20 +370,13 @@ impl IdentityStore {
         peers.push(record);
         peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
 
-        write_toml(
-            self.trusted_peers_path(alias),
-            &TrustedPeersFile { peers },
-        )
+        write_toml(self.trusted_peers_path(alias), &TrustedPeersFile { peers })
     }
 
     /// Remove a trusted peer pin.
     ///
     /// Returns `true` if a record existed and was removed.
-    pub fn remove_trusted_peer(
-        &self,
-        alias: &str,
-        peer_id: &str,
-    ) -> Result<bool, StorageError> {
+    pub fn remove_trusted_peer(&self, alias: &str, peer_id: &str) -> Result<bool, StorageError> {
         validate_alias(alias)?;
 
         let identity_dir = self.identity_dir(alias);
@@ -359,16 +389,151 @@ impl IdentityStore {
         peers.retain(|existing| existing.peer_id != peer_id);
         let removed = peers.len() != before;
 
-        write_toml(
-            self.trusted_peers_path(alias),
-            &TrustedPeersFile { peers },
-        )?;
+        write_toml(self.trusted_peers_path(alias), &TrustedPeersFile { peers })?;
 
         Ok(removed)
     }
 
     pub fn trusted_peers_path(&self, alias: &str) -> PathBuf {
         self.identity_dir(alias).join("trusted_peers.toml")
+    }
+
+    /// Append one encrypted room history entry to the local JSONL history file.
+    pub fn append_room_history(
+        &self,
+        alias: &str,
+        room_id: &str,
+        room_key: &[u8; 32],
+        entry: &RoomHistoryEntry,
+    ) -> Result<(), StorageError> {
+        validate_alias(alias)?;
+        validate_room_id(room_id)?;
+
+        let identity_dir = self.identity_dir(alias);
+        if !identity_dir.exists() {
+            return Err(StorageError::IdentityNotFound(alias.to_string()));
+        }
+
+        if entry.room_id != room_id {
+            return Err(StorageError::InvalidRoomId(entry.room_id.clone()));
+        }
+
+        let history_dir = self.history_dir(alias);
+        fs::create_dir_all(&history_dir).map_err(|source| StorageError::Io {
+            path: history_dir.clone(),
+            source,
+        })?;
+
+        let path = self.room_history_path(alias, room_id);
+        let plaintext = serde_json::to_vec(entry)
+            .map_err(|err| StorageError::JsonSerialize(err.to_string()))?;
+        let (nonce, ciphertext) =
+            encrypt_room_message(room_key, &plaintext).map_err(StorageError::Crypto)?;
+
+        let envelope = EncryptedRoomHistoryEntry {
+            version: 1,
+            nonce_b64: BASE64.encode(nonce),
+            ciphertext_b64: BASE64.encode(ciphertext),
+        };
+
+        let line = serde_json::to_string(&envelope)
+            .map_err(|err| StorageError::JsonSerialize(err.to_string()))?;
+
+        use std::io::Write as _;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| StorageError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(line.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .map_err(|source| StorageError::Io { path, source })
+    }
+
+    /// Load and decrypt all room history entries for the given room.
+    pub fn load_room_history(
+        &self,
+        alias: &str,
+        room_id: &str,
+        room_key: &[u8; 32],
+    ) -> Result<Vec<RoomHistoryEntry>, StorageError> {
+        validate_alias(alias)?;
+        validate_room_id(room_id)?;
+
+        let identity_dir = self.identity_dir(alias);
+        if !identity_dir.exists() {
+            return Err(StorageError::IdentityNotFound(alias.to_string()));
+        }
+
+        let path = self.room_history_path(alias, room_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&path).map_err(|source| StorageError::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        let mut entries = Vec::new();
+        for (line_index, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let envelope: EncryptedRoomHistoryEntry =
+                serde_json::from_str(line).map_err(|err| {
+                    StorageError::JsonDeserialize(format!("line {}: {}", line_index + 1, err))
+                })?;
+
+            if envelope.version != 1 {
+                return Err(StorageError::JsonDeserialize(format!(
+                    "line {}: unsupported history version {}",
+                    line_index + 1,
+                    envelope.version
+                )));
+            }
+
+            let nonce = BASE64.decode(&envelope.nonce_b64).map_err(|err| {
+                StorageError::JsonDeserialize(format!(
+                    "line {}: invalid nonce base64: {}",
+                    line_index + 1,
+                    err
+                ))
+            })?;
+            let ciphertext = BASE64.decode(&envelope.ciphertext_b64).map_err(|err| {
+                StorageError::JsonDeserialize(format!(
+                    "line {}: invalid ciphertext base64: {}",
+                    line_index + 1,
+                    err
+                ))
+            })?;
+
+            let plaintext = decrypt_room_message(room_key, &nonce, &ciphertext)
+                .map_err(StorageError::Crypto)?;
+            let entry: RoomHistoryEntry = serde_json::from_slice(&plaintext).map_err(|err| {
+                StorageError::JsonDeserialize(format!("line {}: {}", line_index + 1, err))
+            })?;
+
+            if entry.room_id != room_id {
+                return Err(StorageError::InvalidRoomId(entry.room_id));
+            }
+
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+
+    pub fn history_dir(&self, alias: &str) -> PathBuf {
+        self.identity_dir(alias).join("history")
+    }
+
+    pub fn room_history_path(&self, alias: &str, room_id: &str) -> PathBuf {
+        self.history_dir(alias).join(format!("{room_id}.jsonl"))
     }
 
     /// Acquire a best-effort local session lock for an identity.
@@ -386,23 +551,13 @@ impl IdentityStore {
         }
 
         let path = self.identity_lock_path(alias);
-        let content = format!(
-            "pid={}\ncreated_at_ms={}\n",
-            process::id(),
-            now_ms()
-        );
+        let content = format!("pid={}\ncreated_at_ms={}\n", process::id(), now_ms());
 
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 use std::io::Write as _;
-                file.write_all(content.as_bytes()).map_err(|source| StorageError::Io {
-                    path,
-                    source,
-                })?;
+                file.write_all(content.as_bytes())
+                    .map_err(|source| StorageError::Io { path, source })?;
                 Ok(())
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -433,7 +588,6 @@ impl IdentityStore {
     pub fn identity_lock_path(&self, alias: &str) -> PathBuf {
         self.identity_dir(alias).join("session.lock")
     }
-
 }
 
 fn validate_alias(alias: &str) -> Result<(), StorageError> {
@@ -447,6 +601,20 @@ fn validate_alias(alias: &str) -> Result<(), StorageError> {
         Ok(())
     } else {
         Err(StorageError::InvalidAlias(alias.to_string()))
+    }
+}
+
+fn validate_room_id(room_id: &str) -> Result<(), StorageError> {
+    let valid = !room_id.is_empty()
+        && room_id.len() <= 64
+        && room_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.');
+
+    if valid {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidRoomId(room_id.to_string()))
     }
 }
 
@@ -548,5 +716,54 @@ mod tests {
             store.create_identity("../evil", "pw").unwrap_err(),
             StorageError::InvalidAlias(_)
         ));
+    }
+
+    #[test]
+    fn room_history_roundtrip() {
+        let unique = format!(
+            "dogel-history-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let store = IdentityStore::at(&root);
+
+        store.create_identity("alice", "password").unwrap();
+
+        let key = [42u8; 32];
+        let first = RoomHistoryEntry {
+            version: 1,
+            room_id: "room-1".to_string(),
+            message_id: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            direction: RoomHistoryDirection::Outbound,
+            peer_id: "peer-a".to_string(),
+            alias: "alice".to_string(),
+            timestamp_ms: 1,
+            body: "hello".to_string(),
+        };
+        let second = RoomHistoryEntry {
+            version: 1,
+            room_id: "room-1".to_string(),
+            message_id: "FEDCBA9876543210FEDCBA9876543210".to_string(),
+            direction: RoomHistoryDirection::Inbound,
+            peer_id: "peer-b".to_string(),
+            alias: "bob".to_string(),
+            timestamp_ms: 2,
+            body: "world".to_string(),
+        };
+
+        store
+            .append_room_history("alice", "room-1", &key, &first)
+            .unwrap();
+        store
+            .append_room_history("alice", "room-1", &key, &second)
+            .unwrap();
+
+        let loaded = store.load_room_history("alice", "room-1", &key).unwrap();
+        assert_eq!(loaded, vec![first, second]);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

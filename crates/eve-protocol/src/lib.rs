@@ -7,6 +7,13 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Current dogel application protocol version.
+///
+/// Phase 12 treats mismatches as hard failures instead of best-effort
+/// compatibility. The field is still named `version` on existing wire structs
+/// to avoid a broad rename in the skeleton.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Plain chat message before room encryption.
 ///
 /// This struct is serialized and then encrypted with the room key. Receivers
@@ -57,13 +64,33 @@ pub struct RoomInvite {
     pub version: u32,
     pub invite_id: String,
     pub room_id: String,
+    /// Random room seed for Phase 12 invite-created rooms.
+    ///
+    /// Receivers do not use this directly as the AEAD key. They derive the room
+    /// key from this seed plus the signed room membership state.
     pub room_key_b64: String,
     pub ephemeral: bool,
+    pub membership: RoomMembershipState,
     pub sender_alias: String,
     pub sender_peer_id: String,
     pub sender_signing_public_key_b64: String,
     pub timestamp_ms: u64,
     pub signature_b64: String,
+}
+
+/// Creator-signed room membership state.
+///
+/// The peer list must be sorted before signing. The signature covers the room
+/// id, creator identity, protocol version and exact peer set, which makes room
+/// key derivation bind to the same state that users accept through invites.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomMembershipState {
+    pub version: u32,
+    pub room_id: String,
+    pub creator_peer_id: String,
+    pub creator_signing_public_key_b64: String,
+    pub peers: Vec<String>,
+    pub membership_signature_b64: String,
 }
 
 /// Request sent through the libp2p request-response protocol.
@@ -133,16 +160,42 @@ struct InviteSigningPayload<'a> {
     room_id: &'a str,
     room_key_b64: &'a str,
     ephemeral: bool,
+    membership: &'a RoomMembershipState,
     sender_alias: &'a str,
     sender_peer_id: &'a str,
     sender_signing_public_key_b64: &'a str,
     timestamp_ms: u64,
 }
 
+/// Stable payload signed by the room creator for membership state.
+#[derive(Debug, Clone, Serialize)]
+struct MembershipSigningPayload<'a> {
+    version: u32,
+    room_id: &'a str,
+    creator_peer_id: &'a str,
+    creator_signing_public_key_b64: &'a str,
+    peers: &'a [String],
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("failed to serialize signing payload: {0}")]
     SigningPayloadSerialize(serde_json::Error),
+
+    #[error("protocol version mismatch: expected {expected}, got {actual}")]
+    VersionMismatch { expected: u32, actual: u32 },
+}
+
+/// Hard-reject any wire object that does not use the current protocol version.
+pub fn require_protocol_version(actual: u32) -> Result<(), ProtocolError> {
+    if actual == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(ProtocolError::VersionMismatch {
+            expected: PROTOCOL_VERSION,
+            actual,
+        })
+    }
 }
 
 impl SignedEncryptedEnvelope {
@@ -177,6 +230,7 @@ impl RoomInvite {
             room_id: &self.room_id,
             room_key_b64: &self.room_key_b64,
             ephemeral: self.ephemeral,
+            membership: &self.membership,
             sender_alias: &self.sender_alias,
             sender_peer_id: &self.sender_peer_id,
             sender_signing_public_key_b64: &self.sender_signing_public_key_b64,
@@ -184,5 +238,73 @@ impl RoomInvite {
         };
 
         serde_json::to_vec(&payload).map_err(ProtocolError::SigningPayloadSerialize)
+    }
+}
+
+impl RoomMembershipState {
+    /// Serialize the exact bytes the room creator signs for membership.
+    pub fn signing_payload(&self) -> Result<Vec<u8>, ProtocolError> {
+        let payload = MembershipSigningPayload {
+            version: self.version,
+            room_id: &self.room_id,
+            creator_peer_id: &self.creator_peer_id,
+            creator_signing_public_key_b64: &self.creator_signing_public_key_b64,
+            peers: &self.peers,
+        };
+
+        serde_json::to_vec(&payload).map_err(ProtocolError::SigningPayloadSerialize)
+    }
+}
+
+/// Return a sorted and deduplicated copy of peer ids for canonical membership.
+pub fn canonical_peer_list(peers: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut peers: Vec<_> = peers.into_iter().collect();
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_peer_list_sorts_and_deduplicates() {
+        let peers = canonical_peer_list([
+            "peer-c".to_string(),
+            "peer-a".to_string(),
+            "peer-c".to_string(),
+            "peer-b".to_string(),
+        ]);
+
+        assert_eq!(peers, ["peer-a", "peer-b", "peer-c"]);
+    }
+
+    #[test]
+    fn membership_payload_changes_when_peer_set_changes() {
+        let one = RoomMembershipState {
+            version: PROTOCOL_VERSION,
+            room_id: "room".to_string(),
+            creator_peer_id: "creator".to_string(),
+            creator_signing_public_key_b64: "key".to_string(),
+            peers: canonical_peer_list(["a".to_string(), "b".to_string()]),
+            membership_signature_b64: String::new(),
+        };
+        let mut two = one.clone();
+        two.peers = canonical_peer_list(["a".to_string(), "b".to_string(), "c".to_string()]);
+
+        assert_ne!(
+            one.signing_payload().unwrap(),
+            two.signing_payload().unwrap()
+        );
+    }
+
+    #[test]
+    fn protocol_version_mismatch_is_rejected() {
+        assert!(require_protocol_version(PROTOCOL_VERSION).is_ok());
+        assert!(matches!(
+            require_protocol_version(PROTOCOL_VERSION + 1),
+            Err(ProtocolError::VersionMismatch { .. })
+        ));
     }
 }

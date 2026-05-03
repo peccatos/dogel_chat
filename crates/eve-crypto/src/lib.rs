@@ -39,7 +39,6 @@ const ROOM_ARGON2_MEMORY_COST_KIB: u32 = 64 * 1024;
 const ROOM_ARGON2_TIME_COST: u32 = 3;
 const ROOM_ARGON2_PARALLELISM: u32 = 1;
 
-
 /// Versioned encrypted file format for local private key material.
 ///
 /// The file is JSON-serializable. The `.enc` extension means "encrypted
@@ -139,8 +138,8 @@ pub fn encrypt_private_key(
     OsRng.fill_bytes(&mut nonce);
 
     let key = derive_key(password, &salt, &params)?;
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
-        .map_err(|_| CryptoError::Encrypt)?;
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_slice()).map_err(|_| CryptoError::Encrypt)?;
 
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), plaintext)
@@ -186,17 +185,16 @@ pub fn decrypt_private_key(
         });
     }
 
-    let ciphertext =
-        BASE64
-            .decode(&file.ciphertext_b64)
-            .map_err(|source| CryptoError::Base64 {
-                field: "ciphertext_b64",
-                source,
-            })?;
+    let ciphertext = BASE64
+        .decode(&file.ciphertext_b64)
+        .map_err(|source| CryptoError::Base64 {
+            field: "ciphertext_b64",
+            source,
+        })?;
 
     let key = derive_key(password, &salt, &file.kdf_params)?;
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
-        .map_err(|_| CryptoError::Decrypt)?;
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.as_slice()).map_err(|_| CryptoError::Decrypt)?;
 
     let plaintext = cipher
         .decrypt(XNonce::from_slice(&nonce), ciphertext.as_ref())
@@ -294,6 +292,32 @@ pub fn derive_room_key(room_id: &str, passphrase: &str) -> Result<[u8; 32], Cryp
     Ok(room_key)
 }
 
+/// Derive a Phase 12 room key bound to signed room state.
+///
+/// The caller must pass the canonical sorted membership list from the verified
+/// `RoomMembershipState`. This prevents two clients with the same room seed
+/// from silently talking across different peer sets or protocol versions.
+pub fn derive_bound_room_key(
+    room_id: &str,
+    sorted_peer_list: &[String],
+    room_seed: &[u8; 32],
+    protocol_version: u32,
+) -> [u8; 32] {
+    let mut material = Vec::new();
+    material.extend_from_slice(b"DOGEL_BOUND_ROOM_KEY_V1\0");
+    material.extend_from_slice(protocol_version.to_string().as_bytes());
+    material.push(0);
+    material.extend_from_slice(room_id.as_bytes());
+    material.push(0);
+
+    for peer in sorted_peer_list {
+        material.extend_from_slice(peer.as_bytes());
+        material.push(0);
+    }
+
+    material.extend_from_slice(room_seed);
+    blake3::derive_key("DOGEL_PHASE12_BOUND_ROOM_KEY", &material)
+}
 
 /// Generate a random 256-bit room key for invite-created rooms.
 ///
@@ -378,13 +402,13 @@ pub fn verify_signature(
     payload: &[u8],
     signature: &[u8],
 ) -> Result<(), CryptoError> {
-    let public_key: [u8; 32] = public_key.try_into().map_err(|_| {
-        CryptoError::InvalidPublicKeyLength(public_key.len())
-    })?;
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| CryptoError::InvalidPublicKeyLength(public_key.len()))?;
 
-    let signature: [u8; 64] = signature.try_into().map_err(|_| {
-        CryptoError::InvalidSignatureLength(signature.len())
-    })?;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| CryptoError::InvalidSignatureLength(signature.len()))?;
 
     let verifying_key = VerifyingKey::from_bytes(&public_key)
         .map_err(|_| CryptoError::InvalidPublicKeyLength(32))?;
@@ -436,5 +460,32 @@ mod tests {
         let decrypted = decrypt_room_message(&key, &nonce, &ciphertext).unwrap();
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn bound_room_key_is_stable_for_sorted_peers() {
+        let seed = [7u8; 32];
+        let peers = vec!["a".to_string(), "b".to_string()];
+
+        let left = derive_bound_room_key("room", &peers, &seed, 1);
+        let right = derive_bound_room_key("room", &peers, &seed, 1);
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn bound_room_key_changes_with_membership_or_version() {
+        let seed = [7u8; 32];
+        let peers = vec!["a".to_string(), "b".to_string()];
+        let with_extra_peer = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        let base = derive_bound_room_key("room", &peers, &seed, 1);
+
+        assert_ne!(
+            base,
+            derive_bound_room_key("room", &with_extra_peer, &seed, 1)
+        );
+        assert_ne!(base, derive_bound_room_key("room", &peers, &seed, 2));
+        assert_ne!(base, derive_bound_room_key("other-room", &peers, &seed, 1));
     }
 }

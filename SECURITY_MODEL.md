@@ -5,11 +5,16 @@
 - Local private keys are encrypted at rest.
 - Passwords are used locally only and are never sent over the network.
 - libp2p provides encrypted authenticated transport.
+- Phase 13 relay/bootstrap improves reachability without changing the application security boundary.
 - Messages are encrypted at the application layer with room keys.
 - Encrypted envelopes are signed with Ed25519.
+- Room history is stored encrypted locally when history mode is enabled.
+- Protocol version mismatches are hard-rejected.
+- Invite-created room keys are bound to room id, signed membership and protocol version.
+- Invite-created room membership is signed by the room creator.
 - Fingerprints are derived from signing public keys.
 - Trust is explicit and local.
-- Replay protection is in-memory per session.
+- Replay protection is bounded and in-memory per session.
 - Inbound room membership is enforced.
 - Strict local policy blocks links, multiline input, control characters and message bursts.
 
@@ -20,8 +25,11 @@
 - Long-term durable replay protection.
 - Group key rotation.
 - Member removal with cryptographic revocation.
+- Full multi-member membership update propagation.
 - Offline sealed invites.
 - Traffic analysis.
+- Relay operator metadata visibility.
+- Relay abuse/resource exhaustion controls.
 - Malicious modified clients.
 - Formal protocol verification.
 
