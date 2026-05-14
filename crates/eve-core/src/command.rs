@@ -17,6 +17,12 @@ pub enum UserCommand {
     Connect {
         multiaddr: String,
     },
+    ConnectPeer {
+        query: String,
+    },
+    ResolvePeer {
+        query: String,
+    },
     Peers,
     Join {
         room_id: String,
@@ -172,6 +178,8 @@ fn parse_tokens(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
         "/login" => parse_login(tokens),
         "/whoami" => expect_no_args(tokens, UserCommand::Whoami),
         "/connect" => parse_connect(tokens),
+        "/connect-peer" => parse_single_arg(tokens, |query| UserCommand::ConnectPeer { query }),
+        "/resolve-peer" => parse_single_arg(tokens, |query| UserCommand::ResolvePeer { query }),
         "/peers" => expect_no_args(tokens, UserCommand::Peers),
         "/join" => parse_join(tokens),
         "/dm" => parse_dm(tokens),
@@ -240,6 +248,18 @@ fn parse_connect(tokens: &[String]) -> Result<UserCommand, CommandParseError> {
             multiaddr: multiaddr.clone(),
         }),
         [_] => Err(CommandParseError::MissingArgument("multiaddr")),
+        [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
+        [] => Err(CommandParseError::Empty),
+    }
+}
+
+fn parse_single_arg<F>(tokens: &[String], f: F) -> Result<UserCommand, CommandParseError>
+where
+    F: FnOnce(String) -> UserCommand,
+{
+    match tokens {
+        [_, value] => Ok(f(value.clone())),
+        [_] => Err(CommandParseError::MissingArgument("query")),
         [_, _, extra, ..] => Err(CommandParseError::UnexpectedArgument(extra.clone())),
         [] => Err(CommandParseError::Empty),
     }
@@ -485,6 +505,26 @@ mod tests {
             parse_command("/identity create Alice").unwrap(),
             UserCommand::IdentityCreate {
                 alias: "Alice".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_connect_peer() {
+        assert_eq!(
+            parse_command("/connect-peer superbia").unwrap(),
+            UserCommand::ConnectPeer {
+                query: "superbia".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_resolve_peer() {
+        assert_eq!(
+            parse_command("/resolve-peer 12D3KooW").unwrap(),
+            UserCommand::ResolvePeer {
+                query: "12D3KooW".to_string(),
             }
         );
     }

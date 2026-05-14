@@ -1,6 +1,6 @@
-# dogel.bin v0.1 phase 16
+# dogel.bin v0.1 phase 17
 
-Phase 16 keeps the encrypted P2P messaging core, trust layer, strict message policy, online invites, Phase 12 protocol hardening, Phase 13 relay/bootstrap readiness, Phase 14 ratatui layout and Phase 15 native TUI routing, then adds AutoNAT/DCUtR external-network hardening.
+Phase 17 keeps the encrypted P2P messaging core, trust layer, strict message policy, online invites, Phase 12 protocol hardening, Phase 13 relay/bootstrap readiness, Phase 14 ratatui layout and Phase 15 native TUI routing, then adds AutoNAT/DCUtR external-network hardening and bootstrap discovery so peers can connect by `peer_id` or alias.
 
 ## Startup
 
@@ -41,6 +41,15 @@ cargo run -p dogel-cli -- \
 
 Run `/login <alias>`, then `/whoami` on each client. When the relay reservation is accepted, `/whoami` prints a `relayed listen` address that can be shared with the other client and used with `/connect`.
 
+For the normal cross-network path, prefer:
+
+```text
+/connect-peer <peer_id|alias>
+/resolve-peer <peer_id|alias>
+```
+
+The client resolves peers through the bootstrap directory, prefers direct addresses when usable, and falls back to relay addresses when needed.
+
 ## TUI scope
 
 The TUI is now the richer interactive terminal frontend:
@@ -54,6 +63,7 @@ The TUI is now the richer interactive terminal frontend:
 - native password prompts for `/identity create` and `/login`;
 - command output routed into the session log instead of shell fallback;
 - background P2P diagnostics routed into the TUI log;
+- peer discovery and `/connect-peer` / `/resolve-peer` routing;
 - same command parser as shell mode;
 - ordinary text without `/` still sends to active room;
 - strict message policy remains active;
@@ -69,9 +79,11 @@ The shell mode remains available for line-oriented debugging, but TUI mode no lo
 /doctor
 /debug on
 /debug off
+/connect-peer <peer_id|alias>
+/resolve-peer <peer_id|alias>
 ```
 
-`/doctor` prints a health report for identity, P2P, rooms, invites, trust and policy.
+`/doctor` prints a health report for identity, P2P, discovery, rooms, invites, trust and policy.
 
 `/debug on|off` toggles runtime debug state and surfaces it in `/doctor`/TUI.
 
@@ -87,6 +99,7 @@ New startup flags:
 
 The existing LAN/direct `/connect <multiaddr>` flow is unchanged. Bootstrap clients also request a circuit relay reservation by listening on the bootstrap peer's `/p2p-circuit` address.
 AutoNAT now reports whether the local node is publicly reachable, and DCUtR attempts a direct upgrade once peers meet through relay.
+Bootstrap discovery now registers the local `peer_id` and alias on the bootstrap node, resolves peers by `peer_id` or alias, and selects direct routes before relay fallbacks.
 
 ## Existing invite flow
 
@@ -117,6 +130,7 @@ hello
 - Online invites use the already-secured libp2p Noise channel, signed invite payloads, and creator-signed membership state.
 - Invite-created room keys are derived from the room seed plus signed peer list, room id and protocol version.
 - Relay/bootstrap only changes transport reachability. The relay forwards encrypted libp2p traffic and does not receive dogel plaintext.
+- Bootstrap discovery stores memory-only peer advertisements and does not expose plaintext messages.
 - When room history is enabled, messages are written to an encrypted local history file and can be replayed from the stored history.
 - Strict policy rejects links, multiline input, control characters and bursts before encryption.
 - TUI mode does not weaken policy; it keeps single-line input only.

@@ -30,6 +30,11 @@
   - background P2P diagnostics routed through events.
 - `/doctor`.
 - `/debug on|off`.
+- Peer discovery and connection routing:
+  - `/connect-peer <peer_id|alias>`;
+  - `/resolve-peer <peer_id|alias>`;
+  - bootstrap directory registration and resolution;
+  - direct-first route selection with relay fallback.
 - Phase 13 relay/bootstrap readiness:
   - `--bootstrap <multiaddr>` startup dialing;
   - `--relay-server` circuit relay service mode;
@@ -50,5 +55,5 @@
 
 ## Recommended next phase
 
-Next phase should harden production relay operations, abuse limits and
-multi-node manual acceptance tests.
+Next phase should harden production relay operations, bootstrap discovery
+freshness/TTL handling and multi-node manual acceptance tests.
