@@ -35,11 +35,14 @@
   - `--relay-server` circuit relay service mode;
   - `--external-addr <multiaddr>` manual public address announcement;
   - relay reservation diagnostics in `/doctor` and `/whoami`.
+- AutoNAT/DCUtR external-network hardening:
+  - NAT status reporting in `/doctor` and `/whoami`;
+  - DCUtR event tracking in diagnostics;
+  - relay-assisted direct-upgrade attempts for cross-network peers.
 
 ## Not done
 
 - X25519 offline invites.
-- AutoNAT/DCUtR hole punching.
 - Production relay operations and abuse controls.
 - Group key rotation.
 - Steganography codecs.
@@ -47,5 +50,5 @@
 
 ## Recommended next phase
 
-Phase 16 should harden external networking with AutoNAT/DCUtR, relay abuse
-limits and multi-node manual acceptance tests.
+Next phase should harden production relay operations, abuse limits and
+multi-node manual acceptance tests.

@@ -436,8 +436,10 @@ async fn main() -> Result<()> {
 /// This remains the primary debugging mode. The TUI is an additional frontend,
 /// not a replacement for the stable shell.
 async fn run_shell_loop(store: &IdentityStore, state: &mut AppState) -> Result<()> {
-    println!("dogel.bin v0.1 phase 15");
-    println!("interactive shell + encrypted P2P messages + trust + online invites + relay/bootstrap + TUI");
+    println!("dogel.bin v0.1 phase 16");
+    println!(
+        "interactive shell + encrypted P2P messages + trust + online invites + relay/bootstrap + AutoNAT/DCUtR + TUI"
+    );
     println!("config root: {}", store.root().display());
     println!("listen: {}", state.listen_addr);
     println!("relay server: {}", state.relay_server);
@@ -534,7 +536,7 @@ async fn run_tui_loop_inner(
     let output_sink = Arc::new(StdMutex::new(VecDeque::new()));
     let _output_guard = GlobalOutputSinkGuard::install(Arc::clone(&output_sink));
 
-    tui.push_log("dogel.bin v0.1 phase 15 TUI".to_string());
+    tui.push_log("dogel.bin v0.1 phase 16 TUI".to_string());
     tui.push_log("type /help, /doctor, /quit; ordinary text sends to active room".to_string());
     tui.push_log("PgUp/PgDn scroll log, Up/Down browse input history".to_string());
 
@@ -961,6 +963,9 @@ struct TuiSnapshot {
     relay_reservations: usize,
     relayed_addrs: usize,
     bootstrap_peers: usize,
+    nat_status: String,
+    public_address: String,
+    dcutr_events: usize,
     policy: String,
     debug: bool,
 }
@@ -990,17 +995,25 @@ async fn build_tui_snapshot(state: &AppState) -> TuiSnapshot {
         (room, rooms.rooms.len())
     };
 
-    let (peer_count, relay_reservations, relayed_addrs) = match state.p2p.as_ref() {
-        Some(p2p) => match p2p.diagnostics().await {
-            Ok(diagnostics) => (
-                diagnostics.connected_peers.len(),
-                diagnostics.relay_reservations.len(),
-                diagnostics.relayed_addrs.len(),
-            ),
-            Err(_) => (0, 0, 0),
-        },
-        None => (0, 0, 0),
-    };
+    let (peer_count, relay_reservations, relayed_addrs, nat_status, public_address, dcutr_events) =
+        match state.p2p.as_ref() {
+            Some(p2p) => match p2p.diagnostics().await {
+                Ok(diagnostics) => (
+                    diagnostics.connected_peers.len(),
+                    diagnostics.relay_reservations.len(),
+                    diagnostics.relayed_addrs.len(),
+                    diagnostics.nat_status,
+                    diagnostics
+                        .public_address
+                        .as_ref()
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    diagnostics.dcutr_events.len(),
+                ),
+                Err(_) => (0, 0, 0, "unknown".to_string(), "none".to_string(), 0),
+            },
+            None => (0, 0, 0, "unknown".to_string(), "none".to_string(), 0),
+        };
 
     let trust_count = {
         let trust = state.trust.lock().await;
@@ -1023,6 +1036,9 @@ async fn build_tui_snapshot(state: &AppState) -> TuiSnapshot {
         relay_reservations,
         relayed_addrs,
         bootstrap_peers: state.bootstrap_peers.len(),
+        nat_status,
+        public_address,
+        dcutr_events,
         policy: state.message_policy.mode_name().to_string(),
         debug: state.debug_enabled,
     }
@@ -1127,6 +1143,9 @@ fn render_tui_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &Tui
         Line::from(format!("relay server: {}", snapshot.relay_server)),
         Line::from(format!("reservations: {}", snapshot.relay_reservations)),
         Line::from(format!("relayed addrs: {}", snapshot.relayed_addrs)),
+        Line::from(format!("nat: {}", snapshot.nat_status)),
+        Line::from(format!("public: {}", snapshot.public_address)),
+        Line::from(format!("dcutr events: {}", snapshot.dcutr_events)),
         Line::from(""),
         Line::from(vec![Span::styled(
             "State",
@@ -1332,6 +1351,15 @@ async fn handle_command(
 
             if let Some(p2p) = state.p2p.as_ref() {
                 let diagnostics = p2p.diagnostics().await?;
+                let public_address = diagnostics
+                    .public_address
+                    .as_ref()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                println!("nat: {}", diagnostics.nat_status);
+                println!("public address: {}", public_address);
+                println!("dcutr events: {}", diagnostics.dcutr_events.len());
+
                 if diagnostics.listen_addrs.is_empty() {
                     println!("  swarm started, but no listen address is confirmed yet");
                 } else {
@@ -3408,10 +3436,19 @@ async fn print_status(state: &AppState, store: &IdentityStore) -> Result<()> {
     println!();
     println!("network:");
     if let Some(p2p) = state.p2p.as_ref() {
-        let peers = p2p.connected_peers().await?;
-        let addrs = p2p.listen_addrs().await?;
+        let diagnostics = p2p.diagnostics().await?;
+        let peers = diagnostics.connected_peers.clone();
+        let addrs = diagnostics.listen_addrs.clone();
+        let public_address = diagnostics
+            .public_address
+            .as_ref()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "none".to_string());
 
         println!("  local_peer_id: {}", p2p.local_peer_id());
+        println!("  nat: {}", diagnostics.nat_status);
+        println!("  public address: {}", public_address);
+        println!("  dcutr events: {}", diagnostics.dcutr_events.len());
         println!("  connected peers: {}", peers.len());
 
         if peers.is_empty() {
@@ -3511,11 +3548,22 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
     lines.push("network:".to_string());
     if let Some(p2p) = state.p2p.as_ref() {
         let diagnostics = p2p.diagnostics().await?;
+        let public_address = diagnostics
+            .public_address
+            .as_ref()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "none".to_string());
         lines.push("  p2p: running".to_string());
         lines.push(format!("  local_peer_id: {}", p2p.local_peer_id()));
         lines.push(format!(
             "  connected peers: {}",
             diagnostics.connected_peers.len()
+        ));
+        lines.push(format!("  nat status: {}", diagnostics.nat_status));
+        lines.push(format!("  public address: {}", public_address));
+        lines.push(format!(
+            "  dcutr events: {}",
+            diagnostics.dcutr_events.len()
         ));
         lines.push(format!(
             "  confirmed listen addresses: {}",
@@ -3555,6 +3603,9 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
             "  external addresses: {}",
             state.external_addrs.len()
         ));
+        lines.push("  nat status: unknown".to_string());
+        lines.push("  public address: none".to_string());
+        lines.push("  dcutr events: 0".to_string());
     }
 
     let (room_count, active_room) = {
