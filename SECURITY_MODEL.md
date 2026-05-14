@@ -6,6 +6,7 @@
 - Passwords are used locally only and are never sent over the network.
 - libp2p provides encrypted authenticated transport.
 - Phase 13 relay/bootstrap improves reachability without changing the application security boundary.
+- Bootstrap discovery stores only short-lived peer advertisements in memory and does not reveal message plaintext.
 - AutoNAT reports external reachability and DCUtR attempts relay-assisted direct upgrades without exposing plaintext.
 - Messages are encrypted at the application layer with room keys.
 - Encrypted envelopes are signed with Ed25519.

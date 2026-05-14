@@ -134,6 +134,8 @@ struct AppState {
     bootstrap_peers: Vec<Multiaddr>,
     relay_server: bool,
     external_addrs: Vec<Multiaddr>,
+    last_peer_resolution: Option<String>,
+    last_peer_connect: Option<String>,
     rooms: SharedRoomBook,
     invites: SharedInviteBook,
     trust: SharedTrustBook,
@@ -358,6 +360,8 @@ impl AppState {
             bootstrap_peers: config.bootstrap_peers.clone(),
             relay_server: config.relay_server,
             external_addrs: config.external_addrs.clone(),
+            last_peer_resolution: None,
+            last_peer_connect: None,
             rooms: Arc::new(Mutex::new(RoomBook::default())),
             invites: Arc::new(Mutex::new(InviteBook::default())),
             trust: Arc::new(Mutex::new(TrustBook::default())),
@@ -963,9 +967,15 @@ struct TuiSnapshot {
     relay_reservations: usize,
     relayed_addrs: usize,
     bootstrap_peers: usize,
+    bootstrap_connected: bool,
+    relay_reservation_active: bool,
     nat_status: String,
     public_address: String,
     dcutr_events: usize,
+    discovery_registered: bool,
+    discovery_alias: String,
+    discovery_last_error: String,
+    usable_route: String,
     policy: String,
     debug: bool,
 }
@@ -995,25 +1005,77 @@ async fn build_tui_snapshot(state: &AppState) -> TuiSnapshot {
         (room, rooms.rooms.len())
     };
 
-    let (peer_count, relay_reservations, relayed_addrs, nat_status, public_address, dcutr_events) =
-        match state.p2p.as_ref() {
-            Some(p2p) => match p2p.diagnostics().await {
-                Ok(diagnostics) => (
-                    diagnostics.connected_peers.len(),
-                    diagnostics.relay_reservations.len(),
-                    diagnostics.relayed_addrs.len(),
-                    diagnostics.nat_status,
-                    diagnostics
-                        .public_address
-                        .as_ref()
-                        .map(|addr| addr.to_string())
-                        .unwrap_or_else(|| "none".to_string()),
-                    diagnostics.dcutr_events.len(),
-                ),
-                Err(_) => (0, 0, 0, "unknown".to_string(), "none".to_string(), 0),
-            },
-            None => (0, 0, 0, "unknown".to_string(), "none".to_string(), 0),
-        };
+    let (
+        peer_count,
+        relay_reservations,
+        relayed_addrs,
+        bootstrap_connected,
+        relay_reservation_active,
+        nat_status,
+        public_address,
+        dcutr_events,
+        discovery_registered,
+        discovery_alias,
+        discovery_last_error,
+        usable_route,
+    ) = match state.p2p.as_ref() {
+        Some(p2p) => match p2p.diagnostics().await {
+            Ok(diagnostics) => (
+                diagnostics.connected_peers.len(),
+                diagnostics.relay_reservations.len(),
+                diagnostics.relayed_addrs.len(),
+                diagnostics.bootstrap_connected,
+                diagnostics.relay_reservation_active,
+                diagnostics.nat_status,
+                diagnostics
+                    .public_address
+                    .as_ref()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                diagnostics.dcutr_events.len(),
+                diagnostics.discovery_registered,
+                diagnostics
+                    .discovery_registered_alias
+                    .as_deref()
+                    .unwrap_or("none")
+                    .to_string(),
+                diagnostics
+                    .discovery_last_error
+                    .as_deref()
+                    .unwrap_or("none")
+                    .to_string(),
+                diagnostics.usable_route,
+            ),
+            Err(_) => (
+                0,
+                0,
+                0,
+                false,
+                false,
+                "unknown".to_string(),
+                "none".to_string(),
+                0,
+                false,
+                "none".to_string(),
+                "none".to_string(),
+                "none".to_string(),
+            ),
+        },
+        None => (
+            0,
+            0,
+            0,
+            false,
+            false,
+            "unknown".to_string(),
+            "none".to_string(),
+            0,
+            false,
+            "none".to_string(),
+            "none".to_string(),
+            "none".to_string(),
+        ),
+    };
 
     let trust_count = {
         let trust = state.trust.lock().await;
@@ -1036,9 +1098,15 @@ async fn build_tui_snapshot(state: &AppState) -> TuiSnapshot {
         relay_reservations,
         relayed_addrs,
         bootstrap_peers: state.bootstrap_peers.len(),
+        bootstrap_connected,
+        relay_reservation_active,
         nat_status,
         public_address,
         dcutr_events,
+        discovery_registered,
+        discovery_alias,
+        discovery_last_error,
+        usable_route,
         policy: state.message_policy.mode_name().to_string(),
         debug: state.debug_enabled,
     }
@@ -1140,12 +1208,24 @@ fn render_tui_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &Tui
         )]),
         Line::from(format!("peers: {}", snapshot.peer_count)),
         Line::from(format!("bootstrap: {}", snapshot.bootstrap_peers)),
+        Line::from(format!(
+            "bootstrap connected: {}",
+            snapshot.bootstrap_connected
+        )),
         Line::from(format!("relay server: {}", snapshot.relay_server)),
         Line::from(format!("reservations: {}", snapshot.relay_reservations)),
+        Line::from(format!(
+            "relay active: {}",
+            snapshot.relay_reservation_active
+        )),
         Line::from(format!("relayed addrs: {}", snapshot.relayed_addrs)),
         Line::from(format!("nat: {}", snapshot.nat_status)),
         Line::from(format!("public: {}", snapshot.public_address)),
         Line::from(format!("dcutr events: {}", snapshot.dcutr_events)),
+        Line::from(format!("usable route: {}", snapshot.usable_route)),
+        Line::from(format!("discovery: {}", snapshot.discovery_registered)),
+        Line::from(format!("alias: {}", snapshot.discovery_alias)),
+        Line::from(format!("disc err: {}", snapshot.discovery_last_error)),
         Line::from(""),
         Line::from(vec![Span::styled(
             "State",
@@ -1163,6 +1243,9 @@ fn render_tui_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &Tui
         Line::from("/login <alias>"),
         Line::from("/whoami"),
         Line::from("/connect <addr>"),
+        Line::from("/connect-peer <peer|alias>"),
+        Line::from("/resolve-peer <peer|alias>"),
+        Line::from("/peers"),
         Line::from("/create-room --ephemeral"),
         Line::from("/invite <peer>"),
         Line::from("/doctor"),
@@ -1278,6 +1361,7 @@ async fn login_with_password(
         bootstrap_peers: state.bootstrap_peers.clone(),
         relay_server: state.relay_server,
         external_addrs: state.external_addrs.clone(),
+        identity_alias: Some(unlocked.alias.clone()),
     };
     let start_result = P2pHandle::start(unlocked.network_keypair.clone(), p2p_config).await;
 
@@ -1317,6 +1401,130 @@ async fn login_with_password(
     state.p2p = Some(p2p);
     state.active_identity = Some(unlocked);
     Ok(())
+}
+
+fn normalize_multiaddr_for_peer(addr: &str, peer_id: PeerId) -> Result<Multiaddr> {
+    let mut parsed: Multiaddr = addr
+        .parse()
+        .with_context(|| format!("invalid multiaddr: {addr}"))?;
+    if peer_id_from_multiaddr(&parsed).is_none() {
+        parsed = parsed.with(libp2p::multiaddr::Protocol::P2p(peer_id));
+    }
+    Ok(parsed)
+}
+
+fn candidate_addrs_for_advertisement(addrs: &[String], peer_id: PeerId) -> Result<Vec<Multiaddr>> {
+    let mut candidates = Vec::new();
+    for addr in addrs {
+        candidates.push(normalize_multiaddr_for_peer(addr, peer_id)?);
+    }
+    candidates.sort_by_key(|addr| addr.to_string());
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn format_discovery_resolution(resolution: &eve_p2p::DiscoveryResolution) -> Vec<String> {
+    let mut lines = vec![
+        format!("query: {}", resolution.query),
+        format!("found: {}", resolution.found),
+    ];
+
+    if let Some(advertisement) = resolution.advertisement.as_ref() {
+        lines.push(format!("peer_id: {}", advertisement.peer_id));
+        lines.push(format!(
+            "alias: {}",
+            advertisement
+                .alias
+                .clone()
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        lines.push(format!("nat status: {}", advertisement.nat_status));
+        lines.push(format!(
+            "direct addrs: {}",
+            advertisement.direct_addrs.len()
+        ));
+        for addr in &advertisement.direct_addrs {
+            lines.push(format!("  direct: {addr}"));
+        }
+        lines.push(format!(
+            "relayed addrs: {}",
+            advertisement.relayed_addrs.len()
+        ));
+        for addr in &advertisement.relayed_addrs {
+            lines.push(format!("  relay: {addr}"));
+        }
+    }
+
+    if let Some(reason) = resolution.reason.as_ref() {
+        lines.push(format!("reason: {reason}"));
+    }
+
+    lines
+}
+
+async fn connect_peer_via_discovery(p2p: &P2pHandle, query: &str) -> Result<String> {
+    let resolution = p2p
+        .resolve_peer(query.to_string())
+        .await
+        .with_context(|| format!("failed to resolve peer '{query}'"))?;
+
+    if !resolution.found {
+        anyhow::bail!(
+            "{}",
+            resolution
+                .reason
+                .unwrap_or_else(|| format!("peer not found: {query}"))
+        );
+    }
+
+    let Some(advertisement) = resolution.advertisement else {
+        anyhow::bail!("resolved peer {query} has no advertisement");
+    };
+
+    let peer_id: PeerId = advertisement.peer_id.parse().with_context(|| {
+        format!(
+            "invalid peer id in advertisement: {}",
+            advertisement.peer_id
+        )
+    })?;
+
+    let direct_candidates =
+        candidate_addrs_for_advertisement(&advertisement.direct_addrs, peer_id)?;
+    let relay_candidates =
+        candidate_addrs_for_advertisement(&advertisement.relayed_addrs, peer_id)?;
+
+    let mut errors = Vec::new();
+    for addr in direct_candidates.iter().chain(relay_candidates.iter()) {
+        match p2p.dial(addr.clone()).await {
+            Ok(()) => {
+                let route = if direct_candidates.iter().any(|candidate| candidate == addr) {
+                    "direct"
+                } else {
+                    "relay"
+                };
+                return Ok(format!("{route} route started: {addr}"));
+            }
+            Err(err) => errors.push(format!("{addr}: {err}")),
+        }
+    }
+
+    anyhow::bail!(
+        "connect-peer failed: peer={} direct_attempts={} relay_attempts={} last_error={}",
+        advertisement.peer_id,
+        direct_candidates.len(),
+        relay_candidates.len(),
+        errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+}
+
+fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    })
 }
 
 async fn handle_command(
@@ -1359,6 +1567,13 @@ async fn handle_command(
                 println!("nat: {}", diagnostics.nat_status);
                 println!("public address: {}", public_address);
                 println!("dcutr events: {}", diagnostics.dcutr_events.len());
+                println!("bootstrap connected: {}", diagnostics.bootstrap_connected);
+                println!(
+                    "relay reservation active: {}",
+                    diagnostics.relay_reservation_active
+                );
+                println!("discovery registered: {}", diagnostics.discovery_registered);
+                println!("usable route: {}", diagnostics.usable_route);
 
                 if diagnostics.listen_addrs.is_empty() {
                     println!("  swarm started, but no listen address is confirmed yet");
@@ -1379,6 +1594,29 @@ async fn handle_command(
                     for addr in diagnostics.relayed_addrs {
                         println!("  {addr}");
                     }
+                }
+
+                println!(
+                    "discovery alias: {}",
+                    diagnostics
+                        .discovery_registered_alias
+                        .as_deref()
+                        .unwrap_or("none")
+                );
+                if let Some(expires_at) = diagnostics.discovery_expires_at_ms {
+                    println!("discovery expires at ms: {expires_at}");
+                }
+                if let Some(err) = diagnostics.discovery_last_error.as_ref() {
+                    println!("discovery last error: {err}");
+                }
+                if let Some(err) = diagnostics.bootstrap_last_error.as_ref() {
+                    println!("bootstrap last error: {err}");
+                }
+                if let Some(err) = diagnostics.relay_last_error.as_ref() {
+                    println!("relay last error: {err}");
+                }
+                if let Some(err) = diagnostics.nat_last_error.as_ref() {
+                    println!("nat last error: {err}");
                 }
             } else {
                 println!("  p2p runtime is not started");
@@ -1404,6 +1642,49 @@ async fn handle_command(
             println!("connection result will appear as [p2p] event");
         }
 
+        UserCommand::ConnectPeer { query } => {
+            let Some(p2p) = state.p2p.as_ref() else {
+                println!("error: p2p runtime is not started");
+                println!();
+                println!("hint:");
+                println!("  /login <alias>");
+                return Ok(());
+            };
+
+            match connect_peer_via_discovery(p2p, &query).await {
+                Ok(line) => {
+                    state.last_peer_connect = Some(format!("query={query} {line}"));
+                    println!("connect-peer resolved:");
+                    println!("  {line}");
+                    println!("connection result will appear as [p2p] event");
+                }
+                Err(err) => {
+                    state.last_peer_connect = Some(format!("query={query} error={err}"));
+                    println!("error: {err}");
+                }
+            }
+        }
+
+        UserCommand::ResolvePeer { query } => {
+            let Some(p2p) = state.p2p.as_ref() else {
+                println!("error: p2p runtime is not started");
+                println!();
+                println!("hint:");
+                println!("  /login <alias>");
+                return Ok(());
+            };
+
+            let resolution = p2p
+                .resolve_peer(query.clone())
+                .await
+                .with_context(|| format!("failed to resolve peer '{query}'"))?;
+            state.last_peer_resolution = Some(format!("query={query} found={}", resolution.found));
+            println!("resolve-peer:");
+            for line in format_discovery_resolution(&resolution) {
+                println!("  {line}");
+            }
+        }
+
         UserCommand::Peers => {
             let Some(p2p) = state.p2p.as_ref() else {
                 println!("error: p2p runtime is not started");
@@ -1413,7 +1694,24 @@ async fn handle_command(
                 return Ok(());
             };
 
-            let peers = p2p.connected_peers().await?;
+            let peers = match p2p.list_peers().await {
+                Ok(peers) if !peers.is_empty() => {
+                    println!("known peers:");
+                    for advert in peers {
+                        println!(
+                            "  {} alias={} direct={} relay={} nat={}",
+                            advert.peer_id,
+                            advert.alias.unwrap_or_else(|| "none".to_string()),
+                            advert.direct_addrs.len(),
+                            advert.relayed_addrs.len(),
+                            advert.nat_status
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(_) => p2p.connected_peers().await?,
+                Err(_) => p2p.connected_peers().await?,
+            };
             if peers.is_empty() {
                 println!("connected peers:");
                 println!("  none");
@@ -3559,8 +3857,13 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
             "  connected peers: {}",
             diagnostics.connected_peers.len()
         ));
+        lines.push(format!(
+            "  bootstrap connected: {}",
+            diagnostics.bootstrap_connected
+        ));
         lines.push(format!("  nat status: {}", diagnostics.nat_status));
         lines.push(format!("  public address: {}", public_address));
+        lines.push(format!("  usable route: {}", diagnostics.usable_route));
         lines.push(format!(
             "  dcutr events: {}",
             diagnostics.dcutr_events.len()
@@ -3579,6 +3882,10 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
             diagnostics.relay_reservations.len()
         ));
         lines.push(format!(
+            "  relay reservation active: {}",
+            diagnostics.relay_reservation_active
+        ));
+        lines.push(format!(
             "  relayed listen addresses: {}",
             diagnostics.relayed_addrs.len()
         ));
@@ -3586,11 +3893,37 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
             "  external addresses: {}",
             diagnostics.external_addrs.len()
         ));
+        lines.push(format!(
+            "  discovery registered: {}",
+            diagnostics.discovery_registered
+        ));
+        lines.push(format!(
+            "  discovery alias: {}",
+            diagnostics
+                .discovery_registered_alias
+                .as_deref()
+                .unwrap_or("none")
+        ));
+        if let Some(expires_at_ms) = diagnostics.discovery_expires_at_ms {
+            lines.push(format!("  discovery expires at ms: {expires_at_ms}"));
+        }
         if !diagnostics.relay_reservation_errors.is_empty() {
             lines.push("  relay reservation errors:".to_string());
             for err in diagnostics.relay_reservation_errors {
                 lines.push(format!("    {err}"));
             }
+        }
+        if let Some(err) = diagnostics.bootstrap_last_error.as_ref() {
+            lines.push(format!("  bootstrap last error: {err}"));
+        }
+        if let Some(err) = diagnostics.relay_last_error.as_ref() {
+            lines.push(format!("  relay last error: {err}"));
+        }
+        if let Some(err) = diagnostics.discovery_last_error.as_ref() {
+            lines.push(format!("  discovery last error: {err}"));
+        }
+        if let Some(err) = diagnostics.nat_last_error.as_ref() {
+            lines.push(format!("  nat last error: {err}"));
         }
     } else {
         lines.push("  p2p: not-started".to_string());
@@ -3675,6 +4008,12 @@ async fn build_doctor_report(state: &AppState, store: &IdentityStore) -> Result<
         "  debug: {}",
         if state.debug_enabled { "on" } else { "off" }
     ));
+    if let Some(last_resolution) = state.last_peer_resolution.as_ref() {
+        lines.push(format!("  last resolve: {last_resolution}"));
+    }
+    if let Some(last_connect) = state.last_peer_connect.as_ref() {
+        lines.push(format!("  last connect: {last_connect}"));
+    }
 
     Ok(lines)
 }
@@ -3723,6 +4062,8 @@ fn print_help() {
     println!("  /login <alias>");
     println!("  /whoami");
     println!("  /connect <multiaddr>");
+    println!("  /connect-peer <peer_id|alias>");
+    println!("  /resolve-peer <peer_id|alias>");
     println!("  /peers");
     println!("  /create-room [room_id] [--ephemeral]");
     println!("  /invite <peer_id>");
@@ -3758,6 +4099,8 @@ fn print_help() {
     println!("  /login <alias>");
     println!("  /whoami");
     println!("  /connect /ip4/<host>/tcp/<port>/p2p/<peer_id>");
+    println!("  /connect-peer <peer_id|alias>");
+    println!("  /resolve-peer <peer_id|alias>");
     println!("  dogel.bin --relay-server --listen /ip4/0.0.0.0/tcp/7777 --external-addr /ip4/<public-ip>/tcp/7777");
     println!("  dogel.bin --bootstrap /ip4/<relay-host>/tcp/7777/p2p/<relay-peer-id>");
     println!("  /create-room --ephemeral");

@@ -78,6 +78,21 @@ pub struct RoomInvite {
     pub signature_b64: String,
 }
 
+/// Discoverable peer metadata published to a bootstrap / directory node.
+///
+/// The peer advertisement is intentionally lightweight and memory-only in this
+/// phase. A bootstrap node stores it in RAM and returns it to resolving peers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerAdvertisement {
+    pub peer_id: String,
+    pub alias: Option<String>,
+    pub direct_addrs: Vec<String>,
+    pub relayed_addrs: Vec<String>,
+    pub nat_status: String,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
 /// Creator-signed room membership state.
 ///
 /// The peer list must be sorted before signing. The signature covers the room
@@ -102,6 +117,33 @@ pub struct RoomMembershipState {
 pub enum DogelRequest {
     Envelope(SignedEncryptedEnvelope),
     Invite(RoomInvite),
+}
+
+/// Discovery requests exchanged with the bootstrap / directory peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DiscoveryRequest {
+    RegisterPeer(PeerAdvertisement),
+    ResolvePeer { query: String },
+    ListPeers,
+}
+
+/// Discovery responses returned by the bootstrap / directory peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum DiscoveryResponse {
+    Ack {
+        ok: bool,
+        error: Option<String>,
+    },
+    ResolvePeerResponse {
+        found: bool,
+        advertisement: Option<PeerAdvertisement>,
+        reason: Option<String>,
+    },
+    ListPeersResponse {
+        peers: Vec<PeerAdvertisement>,
+    },
 }
 
 /// Response to a dogel request.
