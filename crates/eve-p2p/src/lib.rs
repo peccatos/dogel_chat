@@ -12,13 +12,13 @@
 use eve_protocol::{DogelRequest, DogelResponse, RoomInvite, SignedEncryptedEnvelope};
 use futures::StreamExt;
 use libp2p::{
-    identify, noise, ping, relay, request_response,
+    autonat, dcutr, identify, noise, ping, relay, request_response,
     request_response::{json, Message as RequestResponseMessage, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use libp2p_identity::Keypair;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -82,6 +82,10 @@ pub struct P2pDiagnostics {
     pub relay_reservation_errors: Vec<String>,
     pub external_addrs: Vec<Multiaddr>,
     pub relayed_addrs: Vec<Multiaddr>,
+    pub nat_status: String,
+    pub nat_confidence: usize,
+    pub public_address: Option<Multiaddr>,
+    pub dcutr_events: Vec<String>,
 }
 
 /// Events emitted by the P2P runtime to the CLI/application layer.
@@ -145,6 +149,12 @@ impl P2pHandle {
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(|err| P2pError::Noise(err.to_string()))?
             .with_behaviour(|_, relay_client| DogelBehaviour {
+                autonat: {
+                    let mut config = autonat::Config::default();
+                    config.use_connected = true;
+                    autonat::Behaviour::new(local_peer_id, config)
+                },
+                dcutr: dcutr::Behaviour::new(local_peer_id),
                 ping: ping::Behaviour::new(ping::Config::new()),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/dogel/0.1".to_string(),
@@ -321,6 +331,8 @@ enum P2pCommand {
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "DogelBehaviourEvent")]
 struct DogelBehaviour {
+    autonat: autonat::Behaviour,
+    dcutr: dcutr::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
     messaging: json::Behaviour<DogelRequest, DogelResponse>,
@@ -331,11 +343,25 @@ struct DogelBehaviour {
 /// Event enum generated target for the `NetworkBehaviour` derive.
 #[allow(clippy::large_enum_variant)]
 enum DogelBehaviourEvent {
+    AutoNat(autonat::Event),
+    Dcutr(dcutr::Event),
     Ping(ping::Event),
     Identify(identify::Event),
     Messaging(request_response::Event<DogelRequest, DogelResponse>),
     RelayClient(relay::client::Event),
     RelayServer(relay::Event),
+}
+
+impl From<autonat::Event> for DogelBehaviourEvent {
+    fn from(event: autonat::Event) -> Self {
+        Self::AutoNat(event)
+    }
+}
+
+impl From<dcutr::Event> for DogelBehaviourEvent {
+    fn from(event: dcutr::Event) -> Self {
+        Self::Dcutr(event)
+    }
 }
 
 impl From<ping::Event> for DogelBehaviourEvent {
@@ -377,6 +403,7 @@ async fn run_swarm(
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut relay_reservations: HashSet<PeerId> = HashSet::new();
     let mut relay_reservation_errors: Vec<String> = Vec::new();
+    let mut dcutr_events: VecDeque<String> = VecDeque::new();
 
     for bootstrap in &config.bootstrap_peers {
         let Some(peer_id) = peer_id_from_multiaddr(bootstrap) else {
@@ -492,8 +519,15 @@ async fn run_swarm(
                         let listen_addrs: Vec<_> = Swarm::listeners(&swarm).cloned().collect();
                         let external_addrs: Vec<_> =
                             Swarm::external_addresses(&swarm).cloned().collect();
-                        let relayed_addrs =
-                            build_relayed_addrs(&config.bootstrap_peers, &reservations, *swarm.local_peer_id());
+                        let relayed_addrs = build_relayed_addrs(
+                            &config.bootstrap_peers,
+                            &reservations,
+                            *swarm.local_peer_id(),
+                        );
+                        let behaviour = swarm.behaviour_mut();
+                        let nat_status = format!("{:?}", behaviour.autonat.nat_status());
+                        let nat_confidence = behaviour.autonat.confidence();
+                        let public_address = behaviour.autonat.public_address().cloned();
 
                         let _ = reply.send(P2pDiagnostics {
                             connected_peers: peers,
@@ -504,6 +538,10 @@ async fn run_swarm(
                             relay_reservation_errors: relay_reservation_errors.clone(),
                             external_addrs,
                             relayed_addrs,
+                            nat_status,
+                            nat_confidence,
+                            public_address,
+                            dcutr_events: dcutr_events.iter().cloned().collect(),
                         });
                     }
                 }
@@ -582,6 +620,32 @@ async fn run_swarm(
                     SwarmEvent::Behaviour(DogelBehaviourEvent::Messaging(event)) => {
                         handle_messaging_event(event, &event_tx, swarm.behaviour_mut()).await;
                     }
+                    SwarmEvent::Behaviour(DogelBehaviourEvent::AutoNat(event)) => {
+                        match event {
+                            autonat::Event::StatusChanged { old, new } => {
+                                emit_log(
+                                    &event_tx,
+                                    format!("[p2p] autonat status changed: {old:?} -> {new:?}"),
+                                )
+                                .await;
+                            }
+                            other => {
+                                emit_log(&event_tx, format!("[p2p] autonat event: {other:?}"))
+                                    .await;
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(DogelBehaviourEvent::Dcutr(event)) => {
+                        let message = format!(
+                            "[p2p] dcutr event: remote_peer_id={} result={:?}",
+                            event.remote_peer_id, event.result
+                        );
+                        dcutr_events.push_back(message.clone());
+                        while dcutr_events.len() > 16 {
+                            dcutr_events.pop_front();
+                        }
+                        emit_log(&event_tx, message).await;
+                    }
                     SwarmEvent::Behaviour(DogelBehaviourEvent::Ping(event)) => {
                         // Useful during development but too noisy to print every time.
                         let _ = event;
@@ -617,12 +681,20 @@ fn handle_identify_event(
     swarm: &mut Swarm<DogelBehaviour>,
     relay_server: bool,
 ) {
-    if !relay_server {
-        return;
-    }
+    if let identify::Event::Received { peer_id, info, .. } = event {
+        let observed_addr = info.observed_addr.clone();
+        if relay_server {
+            Swarm::add_external_address(swarm, observed_addr.clone());
+        }
 
-    if let identify::Event::Received { info, .. } = event {
-        Swarm::add_external_address(swarm, info.observed_addr);
+        if !info.listen_addrs.is_empty() {
+            let addr = info
+                .listen_addrs
+                .first()
+                .cloned()
+                .or_else(|| Some(observed_addr));
+            swarm.behaviour_mut().autonat.add_server(peer_id, addr);
+        }
     }
 }
 

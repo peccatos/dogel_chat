@@ -1,6 +1,6 @@
-# dogel.bin v0.1 phase 15
+# dogel.bin v0.1 phase 16
 
-Phase 15 keeps the encrypted P2P messaging core, trust layer, strict message policy, online invites, Phase 12 protocol hardening, Phase 13 relay/bootstrap readiness and the Phase 14 ratatui layout, then routes command output natively into the TUI.
+Phase 16 keeps the encrypted P2P messaging core, trust layer, strict message policy, online invites, Phase 12 protocol hardening, Phase 13 relay/bootstrap readiness, Phase 14 ratatui layout and Phase 15 native TUI routing, then adds AutoNAT/DCUtR external-network hardening.
 
 ## Startup
 
@@ -75,7 +75,7 @@ The shell mode remains available for line-oriented debugging, but TUI mode no lo
 
 `/debug on|off` toggles runtime debug state and surfaces it in `/doctor`/TUI.
 
-## Phase 13 networking
+## Phase 16 networking
 
 New startup flags:
 
@@ -86,6 +86,7 @@ New startup flags:
 ```
 
 The existing LAN/direct `/connect <multiaddr>` flow is unchanged. Bootstrap clients also request a circuit relay reservation by listening on the bootstrap peer's `/p2p-circuit` address.
+AutoNAT now reports whether the local node is publicly reachable, and DCUtR attempts a direct upgrade once peers meet through relay.
 
 ## Existing invite flow
 
@@ -125,4 +126,4 @@ hello
 - Some lower-level runtime diagnostics may still be terse until the event model is expanded.
 - Online invites are not offline X25519 sealed invites yet.
 - Legacy `/join --secret` rooms remain a dev shortcut and do not use signed membership.
-- Relay/bootstrap is early Phase 13 readiness. AutoNAT/DCUtR hole punching and production relay operations are not complete yet.
+- Relay/bootstrap is in place. Production relay operations, abuse controls and wider manual acceptance coverage are still incomplete.
